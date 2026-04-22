@@ -84,34 +84,11 @@ class ResidualAttentionBlock(nn.Module):
 
 @dataclass
 class ControlNetOutput(BaseOutput):
-    """
-    The output of [`ControlNetModel`].
-
-    Args:
-        down_block_res_samples (`tuple[torch.Tensor]`):
-            A tuple of downsample activations at different resolutions for each downsampling block. Each tensor should
-            be of shape `(batch_size, channel * resolution, height //resolution, width // resolution)`. Output can be
-            used to condition the original UNet's downsampling activations.
-        mid_down_block_re_sample (`torch.Tensor`):
-            The activation of the midde block (the lowest sample resolution). Each tensor should be of shape
-            `(batch_size, channel * lowest_resolution, height // lowest_resolution, width // lowest_resolution)`.
-            Output can be used to condition the original UNet's middle block activation.
-    """
-
     down_block_res_samples: Tuple[torch.Tensor]
     mid_block_res_sample: torch.Tensor
 
 
 class ControlNetConditioningEmbedding(nn.Module):
-    """
-    Quoting from https://arxiv.org/abs/2302.05543: "Stable Diffusion uses a pre-processing method similar to VQ-GAN
-    [11] to convert the entire dataset of 512 × 512 images into smaller 64 × 64 “latent images” for stabilized
-    training. This requires ControlNets to convert image-based conditions to 64 × 64 feature space to match the
-    convolution size. We use a tiny network E(·) of four convolution layers with 4 × 4 kernels and 2 × 2 strides
-    (activated by ReLU, channels are 16, 32, 64, 128, initialized with Gaussian weights, trained jointly with the full
-    model) to encode image-space conditions ... into feature maps ..."
-    """
-
     # original setting is (16, 32, 96, 256)
     def __init__(
         self,
@@ -160,70 +137,6 @@ class ControlNetConditioningEmbedding(nn.Module):
 
 
 class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
-    """
-    A ControlNet model.
-
-    Args:
-        in_channels (`int`, defaults to 4):
-            The number of channels in the input sample.
-        flip_sin_to_cos (`bool`, defaults to `True`):
-            Whether to flip the sin to cos in the time embedding.
-        freq_shift (`int`, defaults to 0):
-            The frequency shift to apply to the time embedding.
-        down_block_types (`tuple[str]`, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
-            The tuple of downsample blocks to use.
-        only_cross_attention (`Union[bool, Tuple[bool]]`, defaults to `False`):
-        block_out_channels (`tuple[int]`, defaults to `(320, 640, 1280, 1280)`):
-            The tuple of output channels for each block.
-        layers_per_block (`int`, defaults to 2):
-            The number of layers per block.
-        downsample_padding (`int`, defaults to 1):
-            The padding to use for the downsampling convolution.
-        mid_block_scale_factor (`float`, defaults to 1):
-            The scale factor to use for the mid block.
-        act_fn (`str`, defaults to "silu"):
-            The activation function to use.
-        norm_num_groups (`int`, *optional*, defaults to 32):
-            The number of groups to use for the normalization. If None, normalization and activation layers is skipped
-            in post-processing.
-        norm_eps (`float`, defaults to 1e-5):
-            The epsilon to use for the normalization.
-        cross_attention_dim (`int`, defaults to 1280):
-            The dimension of the cross attention features.
-        transformer_layers_per_block (`int` or `Tuple[int]`, *optional*, defaults to 1):
-            The number of transformer blocks of type [`~models.attention.BasicTransformerBlock`]. Only relevant for
-            [`~models.unet_2d_blocks.CrossAttnDownBlock2D`], [`~models.unet_2d_blocks.CrossAttnUpBlock2D`],
-            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`].
-        encoder_hid_dim (`int`, *optional*, defaults to None):
-            If `encoder_hid_dim_type` is defined, `encoder_hidden_states` will be projected from `encoder_hid_dim`
-            dimension to `cross_attention_dim`.
-        encoder_hid_dim_type (`str`, *optional*, defaults to `None`):
-            If given, the `encoder_hidden_states` and potentially other embeddings are down-projected to text
-            embeddings of dimension `cross_attention` according to `encoder_hid_dim_type`.
-        attention_head_dim (`Union[int, Tuple[int]]`, defaults to 8):
-            The dimension of the attention heads.
-        use_linear_projection (`bool`, defaults to `False`):
-        class_embed_type (`str`, *optional*, defaults to `None`):
-            The type of class embedding to use which is ultimately summed with the time embeddings. Choose from None,
-            `"timestep"`, `"identity"`, `"projection"`, or `"simple_projection"`.
-        addition_embed_type (`str`, *optional*, defaults to `None`):
-            Configures an optional embedding which will be summed with the time embeddings. Choose from `None` or
-            "text". "text" will use the `TextTimeEmbedding` layer.
-        num_class_embeds (`int`, *optional*, defaults to 0):
-            Input dimension of the learnable embedding matrix to be projected to `time_embed_dim`, when performing
-            class conditioning with `class_embed_type` equal to `None`.
-        upcast_attention (`bool`, defaults to `False`):
-        resnet_time_scale_shift (`str`, defaults to `"default"`):
-            Time scale shift config for ResNet blocks (see `ResnetBlock2D`). Choose from `default` or `scale_shift`.
-        projection_class_embeddings_input_dim (`int`, *optional*, defaults to `None`):
-            The dimension of the `class_labels` input when `class_embed_type="projection"`. Required when
-            `class_embed_type="projection"`.
-        controlnet_conditioning_channel_order (`str`, defaults to `"rgb"`):
-            The channel order of conditional image. Will convert to `rgb` if it's `bgr`.
-        conditioning_embedding_out_channels (`tuple[int]`, *optional*, defaults to `(16, 32, 96, 256)`):
-            The tuple of output channel for each block in the `conditioning_embedding` layer.
-        global_pool_conditions (`bool`, defaults to `False`):
-    """
 
     _supports_gradient_checkpointing = True
 
@@ -269,13 +182,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         num_control_type=6,
     ):
         super().__init__()
-
-        # If `num_attention_heads` is not defined (which is the case for most models)
-        # it will default to `attention_head_dim`. This looks weird upon first reading it and it is.
-        # The reason for this behavior is to correct for incorrectly named variables that were introduced
-        # when this library was created. The incorrect naming was only discovered much later in https://github.com/huggingface/diffusers/issues/2011#issuecomment-1547958131
-        # Changing `attention_head_dim` to `num_attention_heads` for 40,000+ configurations is too backwards breaking
-        # which is why we correct for the naming here.
         num_attention_heads = num_attention_heads or attention_head_dim
 
         # Check inputs
@@ -366,13 +272,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 raise ValueError(
                     "`class_embed_type`: 'projection' requires `projection_class_embeddings_input_dim` be set"
                 )
-            # The projection `class_embed_type` is the same as the timestep `class_embed_type` except
-            # 1. the `class_labels` inputs are not first converted to sinusoidal embeddings
-            # 2. it projects from an arbitrary input dimension.
-            #
-            # Note that `TimestepEmbedding` is quite general, being mainly linear layers and activations.
-            # When used for embedding actual timesteps, the timesteps are first converted to sinusoidal embeddings.
-            # As a result, `TimestepEmbedding` can be passed arbitrary vectors.
             self.class_embedding = TimestepEmbedding(
                 projection_class_embeddings_input_dim, time_embed_dim
             )
@@ -391,9 +290,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 num_heads=addition_embed_type_num_heads,
             )
         elif addition_embed_type == "text_image":
-            # text_embed_dim and image_embed_dim DON'T have to be `cross_attention_dim`. To not clutter the __init__ too much
-            # they are set to `cross_attention_dim` here as this is exactly the required dimension for the currently only use
-            # case when `addition_embed_type == "text_image"` (Kadinsky 2.1)`
             self.add_embedding = TextImageTimeEmbedding(
                 text_embed_dim=cross_attention_dim,
                 image_embed_dim=cross_attention_dim,
@@ -419,11 +315,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             conditioning_channels=conditioning_channels,
         )
 
-        # Copyright by Qi Xin(2024/07/06)
-        # Condition Transformer(fuse single/multi conditions with input image)
-        # The Condition Transformer augment the feature representation of conditions
-        # The overall design is somewhat like resnet. The output of Condition Transformer is used to predict a condition bias adding to the original condition feature.
-        # num_control_type = 6
         num_trans_channel = 320
         num_trans_head = 8
         num_trans_layer = 1
@@ -444,9 +335,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         )
         # -----------------------------------------------------------------------------------------------------
 
-        # Copyright by Qi Xin(2024/07/06)
-        # Control Encoder to distinguish different control conditions
-        # A simple but effective module, consists of an embedding layer and a linear layer, to inject the control info to time embedding.
         self.control_type_proj = Timesteps(
             addition_time_embed_dim, flip_sin_to_cos, freq_shift
         )
@@ -633,7 +521,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return controlnet
 
     @property
-    # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
         Returns:
@@ -663,24 +550,11 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         return processors
 
-    # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.set_attn_processor
     def set_attn_processor(
         self,
         processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]],
         _remove_lora=False,
     ):
-        r"""
-        Sets the attention processor to use to compute attention.
-
-        Parameters:
-            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
-                The instantiated processor class or a dictionary of processor classes that will be set as the processor
-                for **all** `Attention` layers.
-
-                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
-                processor. This is strongly recommended when setting trainable attention processors.
-
-        """
         count = len(self.attn_processors.keys())
 
         if isinstance(processor, dict) and len(processor) != count:
@@ -704,7 +578,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
 
-    # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.set_default_attn_processor
     def set_default_attn_processor(self):
         """
         Disables custom attention processors and sets the default attention implementation.
@@ -726,21 +599,7 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.set_attn_processor(processor, _remove_lora=True)
 
-    # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.set_attention_slice
     def set_attention_slice(self, slice_size):
-        r"""
-        Enable sliced attention computation.
-
-        When this option is enabled, the attention module splits the input tensor in slices to compute attention in
-        several steps. This is useful for saving some memory in exchange for a small decrease in speed.
-
-        Args:
-            slice_size (`str` or `int` or `list(int)`, *optional*, defaults to `"auto"`):
-                When `"auto"`, input to the attention heads is halved, so attention is computed in two steps. If
-                `"max"`, maximum amount of memory is saved by running only one slice at a time. If a number is
-                provided, uses as many slices as `attention_head_dim // slice_size`. In this case, `attention_head_dim`
-                must be a multiple of `slice_size`.
-        """
         sliceable_head_dims = []
 
         def fn_recursive_retrieve_sliceable_dims(module: torch.nn.Module):
@@ -757,8 +616,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         num_sliceable_layers = len(sliceable_head_dims)
 
         if slice_size == "auto":
-            # half the attention head size is usually a good trade-off between
-            # speed and memory
             slice_size = [dim // 2 for dim in sliceable_head_dims]
         elif slice_size == "max":
             # make smallest slice possible
@@ -817,45 +674,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         guess_mode: bool = False,
         return_dict: bool = True,
     ) -> Union[ControlNetOutput, Tuple]:
-        """
-        The [`ControlNetModel`] forward method.
-
-        Args:
-            sample (`torch.FloatTensor`):
-                The noisy input tensor.
-            timestep (`Union[torch.Tensor, float, int]`):
-                The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.Tensor`):
-                The encoder hidden states.
-            controlnet_cond (`torch.FloatTensor`):
-                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
-            conditioning_scale (`float`, defaults to `1.0`):
-                The scale factor for ControlNet outputs.
-            class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-                Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
-            timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
-                Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
-                timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
-                embeddings.
-            attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
-                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                negative values to the attention scores corresponding to "discard" tokens.
-            added_cond_kwargs (`dict`):
-                Additional conditions for the Stable Diffusion XL UNet.
-            cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
-                A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
-            guess_mode (`bool`, defaults to `False`):
-                In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
-                you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
-            return_dict (`bool`, defaults to `True`):
-                Whether or not to return a [`~models.controlnet.ControlNetOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.controlnet.ControlNetOutput`] **or** `tuple`:
-                If `return_dict` is `True`, a [`~models.controlnet.ControlNetOutput`] is returned, otherwise a tuple is
-                returned where the first element is the sample tensor.
-        """
         # check channel order
         channel_order = self.config.controlnet_conditioning_channel_order
 
@@ -893,9 +711,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
         t_emb = t_emb.to(dtype=sample.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
@@ -935,8 +750,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 add_embeds = add_embeds.to(emb.dtype)
                 aug_emb = self.add_embedding(add_embeds)
 
-        # Copyright by Qi Xin(2024/07/06)
-        # inject control type info to time embedding to distinguish different control conditions
         control_type = added_cond_kwargs.get("control_type")
         control_embeds = self.control_type_proj(control_type.flatten())
         control_embeds = control_embeds.reshape((t_emb.shape[0], -1))
@@ -951,9 +764,6 @@ class ControlNetModel_Union(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         sample = self.conv_in(sample)
         indices = torch.nonzero(control_type[0])
 
-        # Copyright by Qi Xin(2024/07/06)
-        # add single/multi conditons to input image.
-        # Condition Transformer provides an easy and effective way to fuse different features naturally
         inputs = []
         condition_list = []
 

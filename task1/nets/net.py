@@ -253,7 +253,7 @@ class ToneNet(nn.Module):
             0.,
         ]))
 
-    def forward(self, I_rec):
+    def forward(self, I_rec, brightness_scale: float = 1.0):
         B = I_rec.shape[0]
 
         input_lum = (0.299*I_rec[:,0] + 0.587*I_rec[:,1] + 0.114*I_rec[:,2])
@@ -265,7 +265,9 @@ class ToneNet(nn.Module):
 
         curve_A = torch.tanh(raw[:, :3])
         ccm = raw[:, 3:12].reshape(B, 3, 3)
-        brightness = torch.exp(raw[:, 12]).clamp(0.1, 10.0)
+        # 0.85: fixed compensation — ToneNet tends to over-brighten;
+        # brightness_scale: user-controlled multiplier (default 1.0 = neutral)
+        brightness = torch.exp(raw[:, 12]).clamp(0.1, 10.0) * 0.85 * brightness_scale
 
         x = (I_rec * brightness.view(B,1,1,1)).clamp(0, 1)
         A_4d = curve_A.unsqueeze(-1).unsqueeze(-1)

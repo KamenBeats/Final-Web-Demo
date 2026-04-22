@@ -119,7 +119,7 @@ def to_path(f) -> str:
 
 # ── Public inference entry point ─────────────────────────────────────────────
 
-def run(files, apply_phase2: bool = True, align: bool = False):
+def run(files, apply_phase2: bool = True, align: bool = False, brightness: float = 1.0):
     if not files:
         raise gr.Error("Vui lòng chọn ảnh trước khi xử lý.")
     if not model.loaded:
@@ -154,7 +154,8 @@ def run(files, apply_phase2: bool = True, align: bool = False):
     manager.start_inference("task1")
     try:
         t0 = time.time()
-        arr = model.infer(paths, apply_phase2=apply_phase2, align=align)
+        arr = model.infer(paths, apply_phase2=apply_phase2, align=align,
+                          brightness=brightness)
         dt = round(time.time() - t0, 2)
     finally:
         manager.end_inference()
@@ -170,4 +171,5 @@ def run(files, apply_phase2: bool = True, align: bool = False):
     else:
         mode_info = "Ghép ảnh thô"
     info = f"Hoàn thành trong {dt}s · {mode_info} · {len(paths)} ảnh · {arr.shape[1]}×{arr.shape[0]}px"
-    return Image.fromarray(arr), info
+    img = Image.fromarray(arr)
+    return img, info

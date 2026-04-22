@@ -1,7 +1,7 @@
 python Final-Web-Demo/task3/inference_preserve_blend_v2.py \
   --base_model SG161222/RealVisXL_V5.0_Lightning \
   --controlnet_config Final-Web-Demo/task3/config_promax.json \
-  --controlnet_weights Final-Web-Demo/task3/diffusion_pytorch_model_promax.safetensors \
+  --controlnet_weights Final-Web-Demo/task3/controlnet_weight_promax.safetensors \
   --lora_path Final-Web-Demo/task3/lora_best \
   --input_image Final-Web-Demo/task3/image_test/0003.jpg \
   --output_image Final-Web-Demo/task3/outputs/inference/result_v3.png \

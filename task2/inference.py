@@ -10,57 +10,10 @@ import torch
 from PIL import Image
 
 from . import model as M
+from .prompt_enhancer import enhance_prompt  # noqa: F401  (re-exported for ui.py)
 
 
 MAX_T2_LONG = 3840
-
-
-# ── Prompt enhancement (Qwen3-4B) ────────────────────────────────────────────
-
-def enhance_prompt(raw_prompt: str, max_clip_tokens: int = 77) -> str:
-    if M.qwen_tokenizer is None or M.qwen_model is None:
-        return raw_prompt
-    system = (
-        "You are an expert Stable Diffusion prompt writer for interior design inpainting. "
-        "As an interior design expert, please help me enhance the simple descriptions "
-        "of an object into a detailed, vivid presentation of that object. "
-        "Given a description, rewrite it into a detailed, high-quality prompt. "
-        "Rules:\n1. Output ONLY the enhanced prompt\n2. Under 60 words\n"
-        "3. Add: material, lighting, style, quality tags\n4. Comma-separated\n5. No quotes\n"
-    )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": f"Enhance this inpainting prompt: {raw_prompt}"},
-    ]
-    text = M.qwen_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    )
-    # Move chỉ Qwen lên GPU, chạy, rồi move về CPU ngay
-    M.qwen_model.to("cuda:0")
-    try:
-        inputs = M.qwen_tokenizer(text, return_tensors="pt").to("cuda:0")
-        with torch.no_grad():
-            out = M.qwen_model.generate(
-                **inputs, max_new_tokens=120, temperature=0.7,
-                top_p=0.9, do_sample=True,
-            )
-        enhanced = M.qwen_tokenizer.decode(
-            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
-    finally:
-        M.qwen_model.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    enhanced = re.sub(r"<\s*think\s*>.*?<\s*/\s*think\s*>", "", enhanced, flags=re.DOTALL).strip()
-    enhanced = re.sub(r"<\s*think\s*>.*", "", enhanced, flags=re.DOTALL).strip()
-    enhanced = re.sub(r"<[^>]+>", "", enhanced).strip().strip('"\'')
-    if not enhanced:
-        return raw_prompt
-    clip_ids = M.pipe.tokenizer.encode(enhanced)
-    if len(clip_ids) > max_clip_tokens:
-        enhanced = M.pipe.tokenizer.decode(clip_ids[:max_clip_tokens], skip_special_tokens=True)
-    print(f"[Task2] Prompt enhanced: {enhanced}")
-    return enhanced
 
 
 # ── Depth estimation ──────────────────────────────────────────────────────────
@@ -137,13 +90,13 @@ def cap_image(img: Image.Image, max_long: int = MAX_T2_LONG) -> Image.Image:
 
 # ── Blending helpers ──────────────────────────────────────────────────────────
 
-def _alpha_blend(src, dst, mask, feather=5):
+def _alpha_blend(src, dst, mask, feather=15):
     mask_f = cv2.GaussianBlur(mask.astype(float), (feather * 2 + 1, feather * 2 + 1), 0) / 255.0
     mask_f = mask_f[:, :, np.newaxis]
     return (src.astype(float) * mask_f + dst.astype(float) * (1 - mask_f)).astype(np.uint8)
 
 
-def _safe_poisson_blend(src, dst, mask, margin=3):
+def _safe_poisson_blend(src, dst, mask, margin=10):
     kernel = np.ones((margin * 2 + 1, margin * 2 + 1), np.uint8)
     mask_eroded = cv2.erode(mask, kernel, iterations=1)
     H, W = mask.shape
@@ -164,89 +117,54 @@ def _safe_poisson_blend(src, dst, mask, margin=3):
 # ── Core inpaint ──────────────────────────────────────────────────────────────
 
 def inpaint(init_image, mask_image, depth_map, prompt, negative_prompt, steps,
-            strength=1.0, guidance_scale=12.0, cn_scale=0.3):
+            strength=1.0, guidance_scale=12.0, cn_scale=0.3,
+            inpaint_size=1024, crop_padding=128, seed=42):
+    """Crop vùng mask → inpaint VỚI depth → paste lại. (Matches notebook exactly)"""
     W, H = init_image.size
-    mask_np_hard = np.array(mask_image.convert("L"))
-    ys, xs = np.where(mask_np_hard > 127)
+    mask_np = np.array(mask_image.convert("L"))
+    ys, xs = np.where(mask_np > 127)
     if len(xs) == 0:
         raise ValueError("Mask trống")
 
-    mx1, mx2 = int(xs.min()), int(xs.max())
-    my1, my2 = int(ys.min()), int(ys.max())
-    mask_w, mask_h = mx2 - mx1, my2 - my1
-    cx, cy = (mx1 + mx2) / 2, (my1 + my2) / 2
-
-    inpaint_size = 1024
-    target_mask_fraction = 0.5
-    min_mask_px = 400
-    max_context_ratio = 0.85
-
-    target_mask_px = max(min_mask_px, inpaint_size * target_mask_fraction)
-    scale = target_mask_px / max(mask_w, mask_h)
-    crop_size = inpaint_size / scale
-    max_crop = min(W, H) * max_context_ratio
-    if crop_size > max_crop:
-        crop_size = max_crop
-        scale = inpaint_size / crop_size
-
-    half = crop_size / 2
-    x1 = int(max(0, cx - half))
-    y1 = int(max(0, cy - half))
-    x2 = int(min(W, cx + half))
-    y2 = int(min(H, cy + half))
-    if x2 - x1 < crop_size:
-        if x1 == 0: x2 = min(W, int(crop_size))
-        else: x1 = max(0, int(x2 - crop_size))
-    if y2 - y1 < crop_size:
-        if y1 == 0: y2 = min(H, int(crop_size))
-        else: y1 = max(0, int(y2 - crop_size))
-
-    crop_w, crop_h = x2 - x1, y2 - y1
-    inp_w = (int(crop_w * scale) // 64) * 64
-    inp_h = (int(crop_h * scale) // 64) * 64
+    # Simple crop with padding (same as notebook)
+    x1 = max(0, int(xs.min()) - crop_padding)
+    y1 = max(0, int(ys.min()) - crop_padding)
+    x2 = min(W, int(xs.max()) + crop_padding)
+    y2 = min(H, int(ys.max()) + crop_padding)
 
     crop_img   = init_image.convert("RGB").crop((x1, y1, x2, y2))
     crop_mask  = mask_image.convert("L").crop((x1, y1, x2, y2))
     crop_depth = depth_map.convert("RGB").crop((x1, y1, x2, y2))
+    crop_w, crop_h = crop_img.size
+
+    # Scale to inpaint_size (divisible by 64 for SDXL)
+    scale = inpaint_size / max(crop_w, crop_h)
+    inp_w = (int(crop_w * scale) // 64) * 64
+    inp_h = (int(crop_h * scale) // 64) * 64
 
     inp_img   = crop_img.resize((inp_w, inp_h), Image.LANCZOS)
     inp_mask  = crop_mask.resize((inp_w, inp_h), Image.NEAREST)
     inp_depth = crop_depth.resize((inp_w, inp_h), Image.LANCZOS)
 
-    context_strip_w = 256
-    context_thumb       = init_image.resize((context_strip_w, inp_h), Image.LANCZOS)
-    context_depth_thumb = depth_map.resize((context_strip_w, inp_h), Image.LANCZOS)
+    print(f"  Crop: ({x1},{y1})→({x2},{y2}) [{crop_w}x{crop_h}] | Inpaint: {inp_w}x{inp_h}")
 
-    combined_w = inp_w + context_strip_w
-    combined_inp = Image.new("RGB", (combined_w, inp_h))
-    combined_inp.paste(context_thumb, (0, 0))
-    combined_inp.paste(inp_img, (context_strip_w, 0))
-
-    combined_mask = Image.new("L", (combined_w, inp_h), 0)
-    combined_mask.paste(inp_mask, (context_strip_w, 0))
-
-    combined_depth = Image.new("RGB", (combined_w, inp_h))
-    combined_depth.paste(context_depth_thumb, (0, 0))
-    combined_depth.paste(inp_depth, (context_strip_w, 0))
-
-    print(f"  Crop: {crop_w}x{crop_h} | Inpaint: {inp_w}x{inp_h} | Combined: {combined_w}x{inp_h}")
-
-    result_combined = M.pipe(
+    generator = torch.Generator(device=M.T2_DEVICE).manual_seed(seed)
+    result_small = M.pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        image=combined_inp,
-        mask_image=combined_mask,
-        control_image=combined_depth,
+        image=inp_img,
+        mask_image=inp_mask,
+        control_image=inp_depth,
         height=inp_h,
-        width=combined_w,
+        width=inp_w,
         strength=float(strength),
         num_inference_steps=int(steps),
         guidance_scale=float(guidance_scale),
         controlnet_conditioning_scale=float(cn_scale),
+        generator=generator,
     ).images[0]
 
-    result_small = result_combined.crop((context_strip_w, 0, combined_w, inp_h))
-    result_crop  = result_small.resize((crop_w, crop_h), Image.LANCZOS)
+    result_crop = result_small.resize((crop_w, crop_h), Image.LANCZOS)
     output = init_image.convert("RGB").copy()
     output.paste(result_crop, (x1, y1), mask=crop_mask.resize((crop_w, crop_h), Image.NEAREST))
     return output
@@ -271,7 +189,7 @@ def _poisson_blend(result_raw, init_image, mask_pil, label=""):
 # ── Public inference entry point ─────────────────────────────────────────────
 
 def run_inference(editor_val, prompt, step, task_type,
-                  strength=1.0, guidance_scale=12.0, cn_scale=0.3):
+                  strength=1.0, guidance_scale=12.0, cn_scale=0.3, neg_prompt_override="", seed=42):
     if editor_val is None:
         raise gr.Error("Vui lòng upload ảnh trước.")
     bg = editor_val.get("background")
@@ -289,27 +207,53 @@ def run_inference(editor_val, prompt, step, task_type,
     if M.pipe is None:
         gr.Info("Đang load model SDXL lên GPU…")
         M.load_to_ram()
+        print("[Task2] Waiting for load_to_ram() to complete...")
+        M.wait_until_loaded(timeout=180.0)
+        print("[Task2] load_to_ram() completed!")
 
-    manager.activate("task2")
-    manager.start_inference("task2")
+    # Ensure task2 is active
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            print(f"\n[Task2] Activation attempt {attempt+1}/{max_retries}")
+            manager.activate("task2")
+            
+            # If activate() returns without exception, consider it success
+            if manager.active_task == "task2":
+                print(f"[Task2] ✅ Task2 activated successfully")
+                break
+            else:
+                last_error = f"active_task not set (got {manager.active_task})"
+                print(f"[Task2] ⚠️  {last_error}")
+                
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:80]}"
+            print(f"[Task2] ❌ Exception: {last_error}")
+            if attempt < max_retries - 1:
+                time.sleep(0.2)
+    else:
+        # All retries exhausted
+        raise gr.Error(f"Failed to activate task2: {last_error}")
+
+    print(f"[Task2] Starting inference...")
+    
+    # Track whether start_inference was successfully called
+    inference_started = False
     try:
+        manager.start_inference("task2")
+        inference_started = True
+        
         t0 = time.time()
 
         if task_type == "Delete":
-            prompt = "clean empty background, seamless surface, natural lighting"
-            neg_prompt = (
-                "object, furniture, item, person, blurry, smudge, artifacts, "
-                "distorted texture, mismatched pattern, text, watermark, low quality, "
-                "messy, floating debris, ghosting"
-            )
-            strength = 0.95
-            guidance_scale = 8.0
-            cn_scale = 0.0
-            step = 50
-        else:
-            if task_type == "Add" and not prompt.strip():
-                prompt = "a beautiful interior design object, high quality"
-            neg_prompt = (
+            if not prompt.strip():
+                prompt = (
+                    "empty wall, bare floor, plain surface, seamless background, "
+                    "continuation of surroundings, no objects, nothing here, "
+                    "clean empty space, smooth texture, natural lighting"
+                )
+            _default_neg = (
                 "additional objects, extra items, unwanted objects, "
                 "multiple objects, cluttered, busy background, "
                 "unrelated decoration, extra furniture, "
@@ -319,18 +263,41 @@ def run_inference(editor_val, prompt, step, task_type,
                 "cartoon, anime, painting, sketch, "
                 "text, watermark, logo"
             )
+        elif task_type == "Add":
+            if not prompt.strip():
+                prompt = "a beautiful interior design object, high quality"
+            _default_neg = (
+                "low quality, blurry, distorted, deformed, artifacts, "
+                "3d render, CGI, plastic texture, flat shading, "
+                "floating, wrong perspective, impossible geometry, "
+                "cartoon, anime, painting, sketch, "
+                "text, watermark, logo"
+            )
+        else:  # Replace
+            _default_neg = (
+                "additional objects, extra items, unwanted objects, "
+                "multiple objects, cluttered, busy background, "
+                "unrelated decoration, extra furniture, "
+                "low quality, blurry, distorted, deformed, artifacts, "
+                "3d render, CGI, plastic texture, flat shading, "
+                "floating, wrong perspective, impossible geometry, "
+                "cartoon, anime, painting, sketch, "
+                "text, watermark, logo"
+            )
+        neg_prompt = neg_prompt_override.strip() if neg_prompt_override and neg_prompt_override.strip() else _default_neg
 
         W, H = input_img.size
         if (mask_pil.width, mask_pil.height) != (W, H):
             mask_pil = mask_pil.resize((W, H), Image.NEAREST)
-        mask_pil = regularize_mask(mask_pil, target_size=(W, H))
+        mask_pil = mask_pil.convert("L").resize((W, H), Image.NEAREST)
+
         depth_map = estimate_depth(input_img)
 
         result_raw = inpaint(
             input_img, mask_pil, depth_map,
             prompt=prompt, negative_prompt=neg_prompt,
             steps=int(step), strength=strength,
-            guidance_scale=guidance_scale, cn_scale=cn_scale,
+            guidance_scale=guidance_scale, cn_scale=cn_scale, seed=int(seed),
         )
         del depth_map  # free depth map tensor / PIL image before blending
         result = _poisson_blend(result_raw, input_img, mask_pil)
@@ -343,7 +310,9 @@ def run_inference(editor_val, prompt, step, task_type,
 
         elapsed = time.time() - t0
     finally:
-        manager.end_inference()
+        # Only call end_inference if we successfully called start_inference
+        if inference_started:
+            manager.end_inference()
 
     info = (f"Task: {task_type} | Steps: {int(step)} | Strength: {strength} | "
             f"CFG: {guidance_scale} | CN: {cn_scale} | Time: {elapsed:.1f}s")

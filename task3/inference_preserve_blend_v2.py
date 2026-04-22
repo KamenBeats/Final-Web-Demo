@@ -173,10 +173,16 @@ def prepare_image_and_mask(
     preserve_rect = (left_overlap, top_overlap, right_overlap, bottom_overlap)
     mask_draw.rectangle([(left_overlap, top_overlap), (right_overlap, bottom_overlap)], fill=0)
 
-    # cnet_image: must match training exactly.
-    # Training uses app_mask to black out both overlap AND outer canvas.
+    # cnet_image: black out only the pure outer canvas (pixels with no source content).
+    # The overlap band stays visible so the model has it as reference context and
+    # does not have to regenerate from the inner preserve boundary, avoiding blur/seam.
+    cnet_outer_mask = Image.new("L", target_size, 255)  # 255 = black out
+    ImageDraw.Draw(cnet_outer_mask).rectangle(
+        [(margin_x, margin_y), (margin_x + new_width - 1, margin_y + new_height - 1)],
+        fill=0,  # 0 = keep source pixels visible (including overlap band)
+    )
     cnet_image = background.copy()
-    cnet_image.paste(0, (0, 0), app_mask)
+    cnet_image.paste(0, (0, 0), cnet_outer_mask)
 
     return background, app_mask, cnet_image, preserve_rect
 

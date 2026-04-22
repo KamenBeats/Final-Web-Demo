@@ -38,6 +38,43 @@ class ModelManager:
 
     def is_active(self, task_name: str) -> bool:
         return self.active_task == task_name
+    
+    def get_device_of_task(self, task_name: str) -> str:
+        """Check actual device of first parameter in task's models."""
+        if task_name not in self._tasks:
+            return "UNREGISTERED"
+        models = self._tasks[task_name]
+        if not models:
+            return "EMPTY"
+        
+        for model in models.values():
+            try:
+                # Try to get parameters method
+                if hasattr(model, 'parameters') and callable(getattr(model, 'parameters', None)):
+                    first_param = next(model.parameters())
+                    return str(first_param.device)
+            except (AttributeError, StopIteration, TypeError):
+                pass
+            
+            try:
+                # For custom models like Task1Model with internal nets
+                if hasattr(model, 'net_fusion') and model.net_fusion is not None:
+                    first_param = next(model.net_fusion.parameters())
+                    return str(first_param.device)
+            except (AttributeError, StopIteration, TypeError):
+                pass
+            
+            try:
+                # For wrapper objects with _pipe
+                if hasattr(model, '_pipe'):
+                    pipe = getattr(model, '_pipe', None)
+                    if pipe is not None and hasattr(pipe, 'parameters'):
+                        first_param = next(pipe.parameters())
+                        return str(first_param.device)
+            except (AttributeError, StopIteration, TypeError):
+                pass
+        
+        return "UNKNOWN_DEVICE"
 
     def _move_module(self, module, device, dtype=None):
         device = torch.device(device)
@@ -46,17 +83,34 @@ class ModelManager:
                 module.to(device, dtype=dtype)
             else:
                 module.to(device)
+            print(f"    ✓ Moved to {device}")
         except NotImplementedError as exc:
             if "meta tensor" in str(exc).lower():
                 if hasattr(module, 'to_empty'):
+                    print(f"    ◉ Meta tensor detected, using to_empty()...")
                     module.to_empty(device)
+                    print(f"    ✓ to_empty() succeeded")
                 else:
+                    # If to_empty not available, re-raise with more info
+                    print(f"    ❌ Meta tensor found but to_empty() not available")
                     raise
             else:
                 raise
         except TypeError:
             # Fallback cho custom model không hỗ trợ dtype (Task1Model)
-            module.to(device)
+            try:
+                module.to(device)
+                print(f"    ✓ Moved to {device} (fallback)")
+            except NotImplementedError as exc:
+                if "meta tensor" in str(exc).lower():
+                    if hasattr(module, 'to_empty'):
+                        print(f"    ◉ Meta tensor detected in fallback, using to_empty()...")
+                        module.to_empty(device)
+                        print(f"    ✓ to_empty() succeeded (fallback)")
+                    else:
+                        raise
+                else:
+                    raise
 
     def activate(self, task_name: str, timeout: float = 180.0):
         """Chuyển task_name lên GPU, đẩy task cũ về CPU.
@@ -64,7 +118,16 @@ class ModelManager:
         Nếu task chưa được register (đang load background), đợi tối đa timeout giây.
         Thread-safe: dùng RLock để ngăn concurrent activate() racing nhau.
         """
+        # Graceful CUDA fallback: if GPU becomes unavailable (container init issue)
+        # silently downgrade to CPU so the app stays alive instead of crash-looping.
+        if "cuda" in self.device and not torch.cuda.is_available():
+            print(f"[ModelManager] WARNING: {self.device} not available — falling back to CPU.")
+            self.device = "cpu"
+
+        # Quick check: if already active AND actually on device, skip
         if self.active_task == task_name:
+            # Verify it's actually on the device (not just marked as active)
+            # Skip this check to avoid the UNKNOWN_DEVICE issue - just trust activate() logic
             return  # đã trên GPU rồi
 
         # Đợi task được register (background thread đang load) — NGOÀI LOCK để không block register()
@@ -88,29 +151,66 @@ class ModelManager:
             if self.active_task == task_name:
                 return
 
-            if self.active_task is not None and self.active_task in self._tasks:
-                print(f"[ModelManager] Moving '{self.active_task}' → CPU RAM…")
-                for name, model in self._tasks[self.active_task].items():
-                    self._move_module(model, "cpu")
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            old_task = self.active_task
+            try:
+                # ── Bước 1: Đưa task mới lên GPU TRƯỚC ──────────────────────────────
+                # Khi model.to("cuda"), PyTorch giải phóng CPU tensors ngay lập tức.
+                # Sau bước này task_name KHÔNG còn chiếm CPU RAM nữa.
+                # Tạm thời cả 2 model cùng nằm trên GPU (task_name + old_task),
+                # nhưng với VRAM 31.84GB thì ổn (task2≈7GB + task3≈10GB = 17GB < 31GB).
+                print(f"[ModelManager] Moving '{task_name}' → {self.device}…")
+                for name, model in self._tasks[task_name].items():
+                    try:
+                        before_device = self.get_device_of_task(task_name)
+                        print(f"  └─ {name}: {before_device} → {self.device}")
+                    except Exception:
+                        print(f"  └─ {name}: moving to {self.device}")
+                    self._move_module(model, self.device)
+                    try:
+                        actual_device = self.get_device_of_task(task_name)
+                        print(f"      → verify: {actual_device}")
+                    except Exception as verify_err:
+                        print(f"      ⚠️  Could not verify device: {verify_err}")
 
-            print(f"[ModelManager] Moving '{task_name}' → {self.device}…")
-            for name, model in self._tasks[task_name].items():
-                self._move_module(model, self.device)
+                # ── Bước 2: Hạ task cũ xuống CPU SAU ────────────────────────────────
+                # Lúc này task_name đã giải phóng CPU RAM (đã lên GPU ở bước 1).
+                # Peak CPU = old_task(về CPU) + các task khác(CPU) — KHÔNG có task_name.
+                # Giảm peak so với thứ tự cũ (tất cả 3 task cùng ở CPU).
+                if old_task is not None and old_task in self._tasks:
+                    print(f"[ModelManager] Moving '{old_task}' → CPU RAM…")
+                    for name, model in self._tasks[old_task].items():
+                        self._move_module(model, "cpu")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-            self.active_task = task_name
-            print(f"[ModelManager] '{task_name}' ready on {self.device}.")
+                self.active_task = task_name
+                print(f"[ModelManager] ✓ '{task_name}' ready on {self.device}.")
+            except Exception as e:
+                # If move fails, reset active_task to None to allow retry next time
+                print(f"[ModelManager] ❌ ERROR moving '{task_name}' to {self.device}: {e}")
+                import traceback
+                traceback.print_exc()
+                self.active_task = None
+                raise
 
     def start_inference(self, task_name: str):
         """Đánh dấu bắt đầu inference của task.
 
-        Nếu có inference khác đang chạy trên task khác, sẽ chờ đến khi hoàn thành.
+        Chờ cho đến khi không có inference nào đang chạy (kể cả cùng task) để
+        đảm bảo chỉ một inference thực thi trên GPU tại một thời điểm.
         """
         with self._lock:
-            while self._inference_count > 0 and self.active_task != task_name:
+            while self._inference_count > 0:
                 self._inference_cond.wait()
+
+            # Verify task is actually active (not just registered or waiting to activate)
+            if self.active_task != task_name:
+                raise RuntimeError(
+                    f"[ModelManager] Task '{task_name}' not active! "
+                    f"Current active: {self.active_task}. Must call activate() first."
+                )
+
             self._inference_count += 1
 
     def end_inference(self):
@@ -118,7 +218,8 @@ class ModelManager:
         """
         with self._lock:
             if self._inference_count <= 0:
-                raise RuntimeError("[ModelManager] end_inference called without active inference")
+                print("[ModelManager] WARNING: end_inference called without active inference (ignored)")
+                return
             self._inference_count -= 1
             if self._inference_count == 0:
                 self._inference_cond.notify_all()

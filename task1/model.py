@@ -128,11 +128,33 @@ class Task1Model:
         self.device = DEVICE
         self.fp16 = (DEVICE == "cuda")
 
-    # Support .to(device) so ModelManager can move it
-    def to(self, device: str):
+    def parameters(self):
+        """Expose all parameters from internal nets (for ModelManager device checking)."""
         for net in (self.net_fusion, self.net_L, self.tone_net):
             if net is not None:
-                net.to(device)
+                try:
+                    for param in net.parameters():
+                        yield param
+                except (AttributeError, TypeError):
+                    pass
+
+    # Support .to(device) so ModelManager can move it
+    def to(self, device: str):
+        device = torch.device(device)
+        for net in (self.net_fusion, self.net_L, self.tone_net):
+            if net is not None:
+                try:
+                    net.to(device)
+                except NotImplementedError as e:
+                    # Handle meta tensors: use to_empty() instead of to()
+                    if "meta tensor" in str(e).lower():
+                        if hasattr(net, 'to_empty'):
+                            net.to_empty(device)
+                        else:
+                            print(f"[Task1] Warning: meta tensor handling not available, retrying: {e}")
+                            net.to(device)
+                    else:
+                        raise
         return self
 
     def load(self, target_device: str = "cpu"):
@@ -177,7 +199,8 @@ class Task1Model:
         self.loaded = True
         print(f"[Task1] Loaded on {target_device} (fp16={self.fp16})")
 
-    def infer(self, paths: list, apply_phase2: bool = True, align: bool = False) -> np.ndarray:
+    def infer(self, paths: list, apply_phase2: bool = True, align: bool = False,
+              brightness: float = 1.0) -> np.ndarray:
         from .inference import _align_images_sift
         imgs = []
         for p in paths:
@@ -199,7 +222,7 @@ class Task1Model:
                     with torch.autocast('cuda', dtype=dtype,
                                         enabled=(self.fp16 and str(dev) != 'cpu')):
                         inp = output.half() if self.fp16 else output
-                        result, _ = self.tone_net(inp)
+                        result, _ = self.tone_net(inp, brightness_scale=brightness)
                 output = result.float()
             if s:
                 output = F.interpolate(output, size=orig, mode='bicubic', align_corners=False)
@@ -221,7 +244,7 @@ class Task1Model:
                     output, *_ = self.net_fusion(g, L_maps=L_maps)
                     del g, L_maps
                     if apply_phase2 and self.tone_net is not None:
-                        output, _ = self.tone_net(output)
+                        output, _ = self.tone_net(output, brightness_scale=brightness)
             output = output.float()
             if s:
                 output = F.interpolate(output, size=orig,

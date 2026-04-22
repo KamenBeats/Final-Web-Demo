@@ -1,0 +1,30 @@
+# Docker Compose for React + FastAPI mode (single port 7860)
+# Usage: docker compose -f docker-compose.react.yml up --build
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-7860}:7860"
+    environment:
+      MODEL_PHASE_1: ${MODEL_PHASE_1:-task1/model/phase_1/final.pth}
+      MODEL_PHASE_2: ${MODEL_PHASE_2:-task1/model/phase_2/final_with_tonenet.pth}
+      T2_DEVICE: ${T2_DEVICE:-cuda:0}
+      T3_CONTROLNET_WEIGHTS: /models/controlnet_weight_promax.safetensors
+      T3_LORA_PATH: /models/lora_best
+      TRANSFORMERS_NO_EMPTY_INIT: "1"
+      # Expose GPU 0 explicitly before Python starts — prevents "CUDA unknown error"
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    volumes:
+      - .:/app
+      - ./task3/controlnet_weight_promax.safetensors:/models/controlnet_weight_promax.safetensors:ro
+      - ./task3/lora_best:/models/lora_best:ro
+      - ${HF_CACHE:-/home/diffusion/.cache/huggingface}:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0']
+            capabilities: [gpu]
+    restart: unless-stopped

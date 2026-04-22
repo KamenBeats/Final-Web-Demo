@@ -17,11 +17,29 @@ COPY requirements.txt .
 # Cài PyTorch với CUDA 12.8 trước — cache lại
 RUN --mount=type=cache,target=/root/.cache/pip,id=pip-cache \
     pip install "torch>=2.0.1" --index-url https://download.pytorch.org/whl/cu128
+# Install xformers from PyTorch index to match CUDA/torch version
+RUN --mount=type=cache,target=/root/.cache/pip,id=pip-cache \
+    pip install xformers --index-url https://download.pytorch.org/whl/cu128 || \
+    echo "xformers not available for this CUDA version, skipping"
 RUN --mount=type=cache,target=/root/.cache/pip,id=pip-cache \
     pip install -r requirements.txt
 
 COPY . .
 
+# ── Node.js for React frontend build ──────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build React frontend at image build time
+RUN cd react_app/frontend && npm install --production=false && npm run build
+
 EXPOSE 7860
 
-CMD ["python", "app.py"]
+# ── Gradio mode (old) ─────────────────────────────────────────────────────────
+# CMD ["python", "app.py"]
+
+# ── React + FastAPI mode (new) — single port 7860 ─────────────────────────────
+CMD ["python", "-m", "uvicorn", "react_app.backend.main:app", "--host", "0.0.0.0", "--port", "7860"]

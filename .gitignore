@@ -1,0 +1,52 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Build output — keep dist/ for deployment (no build step on server)
+# react_app/frontend/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+build/
+*.egg
+
+# Virtual envs
+venv/
+env/
+.env
+.venv
+
+# Model weights & large files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+
+# Docker
+*.tar
+
+# Temporary
+tmp/
+temp/
+
+# Core dumps
+core
+core.*

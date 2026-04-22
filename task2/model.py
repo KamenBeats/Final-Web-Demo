@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import torch
-from diffusers import StableDiffusionXLControlNetInpaintPipeline, ControlNetModel, DDIMScheduler
+from diffusers import StableDiffusionXLControlNetInpaintPipeline, ControlNetModel, DPMSolverMultistepScheduler
 from transformers import DPTImageProcessor, DPTForDepthEstimation, AutoTokenizer, AutoModelForCausalLM
 
 _T2_DIR = Path(__file__).parent
@@ -25,71 +25,6 @@ dm             = None   # DPTForDepthEstimation
 qwen_tokenizer = None   # AutoTokenizer
 qwen_model     = None   # AutoModelForCausalLM
 _loading       = False
-
-
-# ── LoRA direct merge (bypass peft to avoid meta tensor issues) ──────────────
-
-def _merge_lora_direct(unet, lora_path: str, lora_scale: float = 0.8) -> None:
-    from safetensors.torch import load_file as _load_sf
-    sd = _load_sf(lora_path)
-    pairs: dict = {}
-    for key, tensor in sd.items():
-        k = key
-        for prefix in ("unet.", "base_model.model."):
-            if k.startswith(prefix):
-                k = k[len(prefix):]
-                break
-        if ".lora_A.weight" in k:
-            base = k[: k.rindex(".lora_A.weight")]
-            pairs.setdefault(base, {})["A"] = tensor
-        elif ".lora_B.weight" in k:
-            base = k[: k.rindex(".lora_B.weight")]
-            pairs.setdefault(base, {})["B"] = tensor
-        elif ".lora_down.weight" in k:
-            base = k[: k.rindex(".lora_down.weight")]
-            pairs.setdefault(base, {})["A"] = tensor
-        elif ".lora_up.weight" in k:
-            base = k[: k.rindex(".lora_up.weight")]
-            pairs.setdefault(base, {})["B"] = tensor
-        elif ".lora_A." in k and k.endswith(".weight"):
-            idx = k.rindex(".lora_A.")
-            base = k[:idx]
-            pairs.setdefault(base, {})["A"] = tensor
-        elif ".lora_B." in k and k.endswith(".weight"):
-            idx = k.rindex(".lora_B.")
-            base = k[:idx]
-            pairs.setdefault(base, {})["B"] = tensor
-
-    merged = 0
-    for path, mats in pairs.items():
-        if "A" not in mats or "B" not in mats:
-            continue
-        try:
-            mod = unet
-            for p in path.split("."):
-                mod = mod[int(p)] if p.isdigit() else getattr(mod, p)
-        except (AttributeError, IndexError, TypeError, KeyError):
-            continue
-        if not hasattr(mod, "weight") or mod.weight is None:
-            continue
-        w = mod.weight.data
-        A = mats["A"].to(device=w.device, dtype=w.dtype)
-        B = mats["B"].to(device=w.device, dtype=w.dtype)
-        if A.dim() >= 3:
-            A = A.flatten(1)
-        if B.dim() >= 3:
-            B = B.flatten(1)
-        delta = lora_scale * (B @ A)
-        if w.dim() == 2 and delta.shape == w.shape:
-            w.add_(delta)
-            merged += 1
-        elif w.dim() == 4 and delta.shape == w.shape[:2]:
-            w[:, :, 0, 0].add_(delta)
-            merged += 1
-
-    print(f"[Task2] LoRA merged: {merged}/{len(pairs)} matrices (scale={lora_scale})")
-
-
 # ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_to_ram():
@@ -119,27 +54,39 @@ def load_to_ram():
         # The pipeline loads on CPU by default; avoid redundant .to('cpu') calls that
         # can fail on meta tensors during initialization.
         _pipe.vae.enable_slicing()
+        _pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            _pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
+        )
+        try:
+            _pipe.enable_xformers_memory_efficient_attention()
+            print("[Task2] xformers attention enabled.")
+        except Exception:
+            pass
         _pipe.set_progress_bar_config(disable=True)
-        _pipe.scheduler = DDIMScheduler.from_config(_pipe.scheduler.config)
 
         if LORA_PATH and Path(LORA_PATH).exists():
-            print(f"[Task2] Merging LoRA from {LORA_PATH}…")
-            _merge_lora_direct(_pipe.unet, LORA_PATH, lora_scale=0.8)
+            print(f"[Task2] Loading LoRA from {LORA_PATH}…")
+            _pipe.load_lora_weights(LORA_PATH)
+            _pipe.set_adapters(["default_0"], adapter_weights=[1.0])
+            print("[Task2] LoRA loaded with adapter weight=1.0")
         else:
             print(f"[Task2] No LoRA found at {LORA_PATH}, skipping.")
 
         print("[Task2] Loading DPT depth model → CPU RAM…")
         _dp = DPTImageProcessor.from_pretrained(DPT_ID)
         _dm = DPTForDepthEstimation.from_pretrained(
-            DPT_ID, torch_dtype=torch.float16, low_cpu_mem_usage=False
+            DPT_ID, torch_dtype=torch.float16, device_map={"" : "cpu"}
         )
+        from accelerate.hooks import remove_hook_from_module as _rmhook
+        _rmhook(_dm, recurse=True)
         _dm.eval()
 
         print("[Task2] Loading Qwen3-4B → CPU RAM…")
         _qwen_tok = AutoTokenizer.from_pretrained(QWEN_ID)
         _qwen_mod = AutoModelForCausalLM.from_pretrained(
-            QWEN_ID, torch_dtype=torch.float16, low_cpu_mem_usage=False,
+            QWEN_ID, torch_dtype=torch.float16, device_map={"" : "cpu"},
         )
+        _rmhook(_qwen_mod, recurse=True)  # remove accelerate hooks → plain .to() works
         _qwen_mod.eval()
 
         pipe           = _pipe
@@ -157,9 +104,66 @@ def load_to_ram():
             def __init__(self, pipeline):
                 self._pipe = pipeline
 
+            def parameters(self):
+                """Expose parameters từ underlying pipeline."""
+                try:
+                    for param in self._pipe.parameters():
+                        yield param
+                except (TypeError, AttributeError):
+                    # If parameters() doesn't work, at least yield something so we don't error
+                    pass
+            
             def to(self, device, **kwargs):
                 # Diffusers pipeline dùng cú pháp khác
-                self._pipe.to(torch.device(device))
+                device = torch.device(device)
+                try:
+                    self._pipe.to(device)
+                except NotImplementedError as e:
+                    # Handle meta tensors: DiffusionPipeline is NOT a nn.Module so
+                    # it has no to_empty(). Must iterate components individually,
+                    # or reload directly to the target device.
+                    if "meta tensor" in str(e).lower() or "Cannot copy out of meta tensor" in str(e):
+                        print(f"[Task2] Warning: meta tensor detected, reloading pipeline directly to {device}")
+                        import gc
+                        old_pipe = self._pipe
+                        try:
+                            _cn = ControlNetModel.from_pretrained(
+                                CONTROLNET_ID, torch_dtype=torch.float16
+                            )
+                            _new = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+                                SDXL_INPAINT_ID,
+                                controlnet=_cn,
+                                torch_dtype=torch.float16,
+                                variant="fp16",
+                            )
+                            _new.vae.enable_slicing()
+                            _new.scheduler = DPMSolverMultistepScheduler.from_config(
+                                _new.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
+                            )
+                            try:
+                                _new.enable_xformers_memory_efficient_attention()
+                            except Exception:
+                                pass
+                            _new.set_progress_bar_config(disable=True)
+                            if LORA_PATH and Path(LORA_PATH).exists():
+                                _new.load_lora_weights(LORA_PATH)
+                                _new.set_adapters(["default_0"], adapter_weights=[1.0])
+                            _new.to(device)
+                            self._pipe = _new
+                            # Sync global M.pipe so inference code uses the correct pipeline
+                            import task2.model as _M
+                            _M.pipe = _new
+                            del old_pipe
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            print(f"[Task2] Pipeline reloaded successfully to {device}")
+                        except Exception as reload_err:
+                            print(f"[Task2] Reload failed: {reload_err}")
+                            raise RuntimeError(
+                                f"Cannot move pipeline to {device} (meta tensors present, reload also failed): {reload_err}"
+                            ) from e
+                    else:
+                        raise
                 return self
 
         manager.register("task2", {"pipe": _PipelineWrapper(pipe)})
@@ -184,3 +188,12 @@ def wait_until_loaded(timeout: float = 180.0):
         if time.time() - t0 > timeout:
             raise RuntimeError("[Task2] Timeout waiting for model load.")
         time.sleep(0.5)
+
+
+def ensure_qwen_loaded(timeout: float = 180.0):
+    """Ensure Qwen model is available (wait for preload if still loading)."""
+    wait_until_loaded(timeout)
+    if qwen_model is None or qwen_tokenizer is None:
+        # Try loading if not loaded yet
+        load_to_ram()
+        wait_until_loaded(timeout)

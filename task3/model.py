@@ -14,7 +14,7 @@ from model_manager import manager
 _T3_DIR = Path(__file__).parent
 
 CONTROLNET_CONFIG  = os.environ.get("T3_CONTROLNET_CONFIG",  str(_T3_DIR / "config_promax.json"))
-CONTROLNET_WEIGHTS = os.environ.get("T3_CONTROLNET_WEIGHTS", str(_T3_DIR / "diffusion_pytorch_model_promax.safetensors"))
+CONTROLNET_WEIGHTS = os.environ.get("T3_CONTROLNET_WEIGHTS", str(_T3_DIR / "controlnet_weight_promax.safetensors"))
 BASE_MODEL         = os.environ.get("T3_BASE_MODEL",         "SG161222/RealVisXL_V5.0_Lightning")
 VAE_MODEL          = os.environ.get("T3_VAE_MODEL",          "madebyollin/sdxl-vae-fp16-fix")
 LORA_PATH          = os.environ.get("T3_LORA_PATH",          str(_T3_DIR / "lora_best"))
@@ -84,6 +84,7 @@ def _load_to_ram():
             vae=vae,
             controlnet=controlnet,
             variant="fp16" if (dtype == torch.float16) else None,
+            low_cpu_mem_usage=False,
         )
         pipe.scheduler = TCDScheduler.from_config(pipe.scheduler.config)
 
@@ -96,6 +97,14 @@ def _load_to_ram():
                 print(f"[Task3] LoRA loaded, cast to {dtype} (matches CLI).")
             except ImportError:
                 print("[Task3] peft not installed — skipping LoRA.")
+
+        pipe.vae.enable_slicing()
+        pipe.vae.enable_tiling()
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("[Task3] xformers attention enabled.")
+        except Exception:
+            pass
 
         _pipe = pipe
         print("[Task3] Pipeline in CPU RAM — registering with ModelManager…")
