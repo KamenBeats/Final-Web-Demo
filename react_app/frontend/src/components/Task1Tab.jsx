@@ -336,10 +336,6 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
               <SliderTrack><SliderFilledTrack bg="brand.500" /></SliderTrack>
               <SliderThumb boxSize={3} />
             </Slider>
-            {/* <Flex justify="space-between" mt={1}>
-              <Text fontSize="xs" color="gray.500">0%: Không tăng cường</Text>
-              <Text fontSize="xs" color="gray.500">100%: Tối đa</Text>
-            </Flex> */}
           </Box>
 
           <Button
