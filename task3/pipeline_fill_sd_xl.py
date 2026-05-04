@@ -11,7 +11,10 @@ from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from .controlnet_union import ControlNetModel_Union
+try:
+    from .controlnet_union import ControlNetModel_Union
+except ImportError:
+    from controlnet_union import ControlNetModel_Union
 
 
 def latents_to_rgb(latents):
@@ -533,7 +536,20 @@ class StableDiffusionXLFillPipeline(DiffusionPipeline, StableDiffusionMixin):
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
                 ):
                     progress_bar.update()
-                    yield latents_to_rgb(latents)
+                    is_last = (i == len(timesteps) - 1)
+                    if is_last:
+                        # Final step: proper VAE decode for full-quality output
+                        with torch.no_grad():
+                            image_latents = latents.to(dtype=self.vae.dtype) / self.vae.config.scaling_factor
+                            decoded = self.vae.decode(image_latents, return_dict=False)[0]
+                        # Normalize [-1,1] → [0,255] uint8 PIL image
+                        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+                        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+                        decoded = (decoded[0] * 255).round().astype("uint8")
+                        yield PIL.Image.fromarray(decoded)
+                    else:
+                        # Intermediate steps: fast latent-space preview
+                        yield latents_to_rgb(latents)
 
         latents = latents / self.vae.config.scaling_factor
         image = self.vae.decode(latents, return_dict=False)[0]

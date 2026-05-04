@@ -13,6 +13,7 @@ from .inference import (
     _ALIGN_OPTS,
 )
 from .model import preload_to_cpu
+from .prompt_enhancer import enhance_prompt as _qwen_enhance
 
 _IMG_H = 480  # fixed height — identical for both input and output images
 
@@ -129,13 +130,23 @@ def create_task3_tab():
     # ══════════════════════════════════════════════════════════════════════════
     with gr.Row():
         with gr.Column(scale=1):
-            prompt_input = gr.Textbox(
-                label="Prompt mô tả nội dung mở rộng (tuỳ chọn)",
-                placeholder="Để trống để dùng prompt mặc định...",
-                lines=2,
-            )
+            with gr.Group():
+                prompt_input = gr.Textbox(
+                    label="Prompt mô tả nội dung mở rộng (tuỳ chọn)",
+                    placeholder="Để trống để dùng prompt mặc định, hoặc nhập mô tả rồi nhấn Enhance...",
+                    lines=2,
+                )
+                enhance_button = gr.Button(
+                    "✨ Enhance Prompt (Qwen)",
+                    variant="secondary",
+                    size="sm",
+                )
+                enhance_status = gr.HTML(value="", visible=False)
         with gr.Column(scale=1):
             run_button = gr.Button("🚀 Generate", variant="primary")
+
+    # Hidden state: BLIP caption of the uploaded image
+    caption_state = gr.State("")
 
     # ── History ───────────────────────────────────────────────────────────────
     with gr.Accordion("📋 Lịch sử xử lý", open=False):
@@ -236,6 +247,88 @@ def create_task3_tab():
         queue=False,
     )
 
+    # ── Auto-caption when image is uploaded ──────────────────────────────────
+    def _caption_image(image):
+        """Đọc phong cách/nội dung ảnh bằng BLIP — chạy nhanh trên CPU."""
+        if image is None:
+            return ""
+        try:
+            from transformers import BlipProcessor, BlipForConditionalGeneration
+            import torch
+            _proc = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            _mod  = BlipForConditionalGeneration.from_pretrained(
+                "Salesforce/blip-image-captioning-base",
+                torch_dtype=torch.float32,
+            )
+            _mod.eval()
+            inputs = _proc(image.convert("RGB"), return_tensors="pt")
+            with torch.no_grad():
+                out = _mod.generate(**inputs, max_new_tokens=80)
+            caption = _proc.decode(out[0], skip_special_tokens=True).strip()
+            del _mod, _proc
+            print(f"[Task3 Caption] {caption}")
+            return caption
+        except Exception as e:
+            print(f"[Task3 Caption] failed: {e}")
+            return ""
+
+    input_image.change(
+        fn=_caption_image,
+        inputs=input_image,
+        outputs=caption_state,
+        queue=True,
+    )
+
+    # ── Enhance button ────────────────────────────────────────────────────────
+    def _enhance_prompt_ui(raw_prompt, caption,
+                           align, resize_opt, resize_pct, res_label,
+                           ov_left, ov_right, ov_top, ov_bottom):
+        import torch
+        from . import model as M
+        from model_manager import manager
+        from .prompt_enhancer import move_qwen_to_cpu
+
+        # Move diffusion pipeline off GPU to free VRAM for Qwen
+        if M._pipe is not None:
+            try:
+                M._pipe.to("cpu")
+            except Exception:
+                pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        manager.active_task = None
+
+        # Use caption as scene description if user left prompt empty
+        scene = raw_prompt.strip() or caption or ""
+
+        enhanced = _qwen_enhance(
+            raw_prompt=scene,
+            image_caption=caption if not raw_prompt.strip() else "",
+            alignment=align,
+            resize_option=resize_opt,
+            custom_resize_pct=resize_pct,
+            target_res_label=res_label,
+            overlap_left=ov_left,
+            overlap_right=ov_right,
+            overlap_top=ov_top,
+            overlap_bottom=ov_bottom,
+        )
+        move_qwen_to_cpu()
+        status_html = (
+            "<span style='color:#4CAF50;font-size:0.85em'>✅ Prompt đã được Qwen enhance</span>"
+        )
+        return enhanced, gr.update(value=status_html, visible=True)
+
+    enhance_button.click(
+        fn=_enhance_prompt_ui,
+        inputs=[
+            prompt_input, caption_state,
+            alignment, resize_option, custom_resize_pct, target_res,
+            overlap_left, overlap_right, overlap_top, overlap_bottom,
+        ],
+        outputs=[prompt_input, enhance_status],
+    )
+
     # ── Auto-preview on canvas param change ───────────────────────────────────
     for _comp in _preview_inputs:
         _comp.change(
@@ -281,6 +374,24 @@ def create_task3_tab():
     # ── Run ───────────────────────────────────────────────────────────────────
     _NUM_STEPS_IDX = len(_preview_inputs) + 1  # prompt is at +0, num_steps at +1
 
+    def _maybe_enhance(raw_prompt, caption,
+                       align, resize_opt, resize_pct, res_label,
+                       ov_left, ov_right, ov_top, ov_bottom):
+        """Chỉ gọi Qwen3 khi prompt rỗng. Nếu đã có prompt → giữ nguyên."""
+        if raw_prompt.strip():
+            return gr.update(), gr.update(visible=False)
+        return _enhance_prompt_ui(
+            raw_prompt, caption,
+            align, resize_opt, resize_pct, res_label,
+            ov_left, ov_right, ov_top, ov_bottom,
+        )
+
+    _enhance_inputs = [
+        prompt_input, caption_state,
+        alignment, resize_option, custom_resize_pct, target_res,
+        overlap_left, overlap_right, overlap_top, overlap_bottom,
+    ]
+
     def _run(*args):
         t0   = time.time()
         last = None
@@ -300,6 +411,10 @@ def create_task3_tab():
         ).then(
             fn=lambda: gr.update(selected="tab_result"),
             outputs=output_tabs,
+        ).then(
+            fn=_maybe_enhance,
+            inputs=_enhance_inputs,
+            outputs=[prompt_input, enhance_status],
         ).then(
             fn=_run,
             inputs=_all_inputs,

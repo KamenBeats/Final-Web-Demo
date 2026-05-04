@@ -55,7 +55,9 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
   const [padRight, setPadRight] = useState(0)
 
   const [history, setHistory] = useState([])
+  const [enhancing, setEnhancing] = useState(false)
   const fileRef = useRef(null)
+  const previewAbortRef = useRef(null)
   const toast = useToast()
 
   /* Reset locked pad directions when alignment changes */
@@ -66,6 +68,43 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
     if (locked.left) setPadLeft(0)
     if (locked.right) setPadRight(0)
   }, [alignment])
+
+  const handleEnhance = async () => {
+    setEnhancing(true)
+    try {
+      const fd = new FormData()
+      fd.append('prompt', prompt)
+      fd.append('alignment', alignment)
+      fd.append('resize_option', resizeOption)
+      fd.append('target_res', targetRes)
+      fd.append('overlap_left', overlapLeft)
+      fd.append('overlap_right', overlapRight)
+      fd.append('overlap_top', overlapTop)
+      fd.append('overlap_bottom', overlapBottom)
+      const resp = await fetch('/api/task3/enhance-prompt', { method: 'POST', body: fd })
+      if (!resp.ok) throw new Error(await resp.text())
+      const { job_id } = await resp.json()
+
+      // Poll for completion
+      while (true) {
+        const statusResp = await fetch(`/api/job/${job_id}/status`)
+        if (!statusResp.ok) throw new Error('Lost enhance job')
+        const data = await statusResp.json()
+        if (data.status === 'done') {
+          const parsed = JSON.parse(data.text || '{}')
+          if (parsed.enhanced) setPrompt(parsed.enhanced)
+          toast({ title: 'Prompt enhanced ✨', status: 'success', duration: 2000 })
+          break
+        }
+        if (data.status === 'error') throw new Error(data.error || 'Enhance failed')
+        await new Promise((r) => setTimeout(r, 1500))
+      }
+    } catch (err) {
+      toast({ title: 'Enhance failed', description: err.message, status: 'error', duration: 3000 })
+    } finally {
+      setEnhancing(false)
+    }
+  }
 
   const loadExternalImage = useCallback(async (blobUrl) => {
     try {
@@ -142,18 +181,29 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
     padLeft, padRight, padTop, padBottom,
   ])
 
-  /* Fetch preview only when Preview tab is active, with debounce */
+  /* Fetch preview only when Preview tab is active, with reduced debounce */
   useEffect(() => {
     if (!imageFile || inputTab !== 1) return
     const timer = setTimeout(async () => {
       try {
+        // Cancel previous preview request if still pending
+        if (previewAbortRef.current) {
+          previewAbortRef.current.abort()
+        }
+        previewAbortRef.current = new AbortController()
+
         const fd = buildFormData()
-        const resp = await fetch('/api/task3/preview', { method: 'POST', body: fd })
+        const resp = await fetch('/api/task3/preview', {
+          method: 'POST',
+          body: fd,
+          signal: previewAbortRef.current.signal
+        })
         if (resp.ok) setPreviewUrl(URL.createObjectURL(await resp.blob()))
-      } catch {
-        // ignore preview errors
+      } catch (err) {
+        // Ignore preview errors and aborted requests
+        if (err.name !== 'AbortError') console.error(err)
       }
-    }, 500)
+    }, 300)  // Reduced debounce from 500ms to 300ms for faster loading
     return () => clearTimeout(timer)
   }, [buildFormData, imageFile, inputTab])
 
@@ -231,53 +281,8 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
       setPadRight(500)
       setPrompt(demoPrompt)
       setInputTab(0)
-
-      // Build form data manually for immediate inference
-      setLoading(true)
-      await fetch('/api/activate/task3', { method: 'POST' }).catch(() => { })
-
-      const fd = new FormData()
-      fd.append('image', file)
-      fd.append('target_res', 'Customize')
-      fd.append('custom_w', 1024)
-      fd.append('custom_h', 1024)
-      fd.append('alignment', 'Middle')
-      fd.append('resize_option', 'Full')
-      fd.append('custom_resize_pct', 100)
-      fd.append('overlap_percentage', 10)
-      fd.append('overlap_left', 10)
-      fd.append('overlap_right', 10)
-      fd.append('overlap_top', 10)
-      fd.append('overlap_bottom', 10)
-      fd.append('pad_left', 500)
-      fd.append('pad_right', 500)
-      fd.append('pad_top', 0)
-      fd.append('pad_bottom', 0)
-      fd.append('prompt', demoPrompt)
-      fd.append('num_steps', numSteps)
-      fd.append('sharpen', sharpen)
-      fd.append('lora_scale', loraScale)
-
-      const t0 = Date.now()
-      const submitResp = await fetch('/api/task3/run', { method: 'POST', body: fd })
-      if (!submitResp.ok) throw new Error(await submitResp.text())
-      const { job_id } = await submitResp.json()
-
-      while (true) {
-        await new Promise(r => setTimeout(r, 10000))
-        const statusResp = await fetch(`/api/job/${job_id}/status`)
-        if (!statusResp.ok) throw new Error('Lost job status')
-        const { status, error } = await statusResp.json()
-        if (status === 'error') throw new Error(error || 'Inference failed')
-        if (status === 'done') break
-      }
-
-      const resultResp = await fetch(`/api/job/${job_id}/result`)
-      if (!resultResp.ok) throw new Error(await resultResp.text())
-      const resultBlobUrl = URL.createObjectURL(await resultResp.blob())
-      setResultUrl(resultBlobUrl)
-      setInfo(`Hoàn thành trong ${((Date.now() - t0) / 1000).toFixed(1)}s · ${numSteps} steps`)
-      setHistory((prev) => [{ url: resultBlobUrl }, ...prev.slice(0, 19)])
+      setLoading(false)
+      toast({ title: 'Demo loaded ✓', description: 'Bấm "Xử lý" để chạy inference', status: 'success', duration: 3000 })
     } catch (err) {
       toast({ title: 'Demo Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
@@ -378,15 +383,32 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
                         <Text fontSize="xs" color="gray.400">{s.label}</Text>
                         <Text fontSize="xs" color="brand.300" fontWeight="600">{s.val}</Text>
                       </Flex>
-                      <Slider
-                        value={s.val} onChange={s.set}
-                        min={0} max={50} size="sm"
-                      >
-                        <SliderTrack>
-                          <SliderFilledTrack bg="brand.500" />
-                        </SliderTrack>
-                        <SliderThumb boxSize={3} />
-                      </Slider>
+                      <HStack spacing={2}>
+                        <Box flex={1}>
+                          <Slider
+                            value={s.val} onChange={s.set}
+                            min={0} max={50} size="sm"
+                          >
+                            <SliderTrack>
+                              <SliderFilledTrack bg="brand.500" />
+                            </SliderTrack>
+                            <SliderThumb boxSize={3} />
+                          </Slider>
+                        </Box>
+                        <NumberInput
+                          size="xs" w="50px"
+                          value={s.val}
+                          onChange={(_, v) => s.set(Math.min(50, Math.max(0, v || 0)))}
+                          min={0}
+                          max={50}
+                        >
+                          <NumberInputField />
+                          <NumberInputStepper>
+                            <NumberIncrementStepper />
+                            <NumberDecrementStepper />
+                          </NumberInputStepper>
+                        </NumberInput>
+                      </HStack>
                     </Box>
                   ))}
                 </SimpleGrid>
@@ -407,15 +429,39 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
                         {s.fmt ? s.fmt(s.val) : s.val}
                       </Text>
                     </Flex>
-                    <Slider
-                      value={s.val} onChange={s.set}
-                      min={s.min} max={s.max} step={s.step} size="sm"
-                    >
-                      <SliderTrack>
-                        <SliderFilledTrack bg="brand.500" />
-                      </SliderTrack>
-                      <SliderThumb boxSize={3} />
-                    </Slider>
+                    <HStack spacing={2}>
+                      <Box flex={1}>
+                        <Slider
+                          value={s.val} onChange={s.set}
+                          min={s.min} max={s.max} step={s.step} size="sm"
+                        >
+                          <SliderTrack>
+                            <SliderFilledTrack bg="brand.500" />
+                          </SliderTrack>
+                          <SliderThumb boxSize={3} />
+                        </Slider>
+                      </Box>
+                      <NumberInput
+                        size="xs" w="60px"
+                        value={s.fmt ? s.fmt(s.val) : s.val}
+                        onChange={(val) => {
+                          const num = parseFloat(val)
+                          if (!isNaN(num) && num >= s.min && num <= s.max) {
+                            s.set(num)
+                          }
+                        }}
+                        min={s.min}
+                        max={s.max}
+                        step={s.step}
+                        isValidCharacter={(char) => /[0-9.\-]/.test(char)}
+                      >
+                        <NumberInputField />
+                        <NumberInputStepper>
+                          <NumberIncrementStepper />
+                          <NumberDecrementStepper />
+                        </NumberInputStepper>
+                      </NumberInput>
+                    </HStack>
                   </Box>
                 ))}
               </Box>
@@ -612,30 +658,38 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
       </SimpleGrid>
 
       {/* ── Prompt + Generate ── */}
-      <Flex gap={4} align="end" mb={5}>
-        <Box flex={1}>
-          <Text fontSize="xs" fontWeight="600" color="gray.400" mb={1}>
-            Prompt mô tả nội dung mở rộng (tuỳ chọn)
-          </Text>
-          <Textarea
-            size="sm" rows={2} bg="whiteAlpha.50"
-            border="1px solid" borderColor="whiteAlpha.200"
-            placeholder="Để trống để dùng prompt mặc định..."
-            value={prompt} onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => e.stopPropagation()}
-            _focus={{ borderColor: 'brand.400' }}
-          />
-        </Box>
-        <Button
-          colorScheme="brand" size="lg" px={8}
-          onClick={handleRun}
-          isDisabled={loading || !imageFile}
-          isLoading={loading} loadingText="Đang xử lý..."
-          flexShrink={0}
-        >
-          🚀 Generate
-        </Button>
-      </Flex>
+      <Box mb={5}>
+        <Text fontSize="xs" fontWeight="600" color="gray.400" mb={1}>
+          Prompt mô tả nội dung mở rộng (tuỳ chọn)
+        </Text>
+        <Textarea
+          size="sm" rows={2} bg="whiteAlpha.50"
+          border="1px solid" borderColor="whiteAlpha.200"
+          placeholder="Để trống để dùng prompt mặc định, hoặc nhập mô tả rồi nhấn Enhance..."
+          value={prompt} onChange={(e) => setPrompt(e.target.value)}
+          onKeyDown={(e) => e.stopPropagation()}
+          _focus={{ borderColor: 'brand.400' }}
+          mb={2}
+        />
+        <Flex gap={3} align="center">
+          <Button
+            size="sm" variant="outline" colorScheme="brand"
+            onClick={handleEnhance}
+            isDisabled={enhancing}
+            isLoading={enhancing} loadingText="Đang enhance..."
+          >
+            ✨ Enhance Prompt (Qwen)
+          </Button>
+          <Button
+            colorScheme="brand" size="sm" px={6}
+            onClick={handleRun}
+            isDisabled={loading || !imageFile}
+            isLoading={loading} loadingText="Đang xử lý..."
+          >
+            🚀 Generate
+          </Button>
+        </Flex>
+      </Box>
 
       {/* ── History ── */}
       {history.length > 0 && (

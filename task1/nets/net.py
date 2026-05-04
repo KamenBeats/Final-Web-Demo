@@ -265,9 +265,8 @@ class ToneNet(nn.Module):
 
         curve_A = torch.tanh(raw[:, :3])
         ccm = raw[:, 3:12].reshape(B, 3, 3)
-        # 0.85: fixed compensation — ToneNet tends to over-brighten;
         # brightness_scale: user-controlled multiplier (default 1.0 = neutral)
-        brightness = torch.exp(raw[:, 12]).clamp(0.1, 10.0) * 0.85 * brightness_scale
+        brightness = torch.exp(raw[:, 12]).clamp(0.1, 10.0) * brightness_scale
 
         x = (I_rec * brightness.view(B,1,1,1)).clamp(0, 1)
         A_4d = curve_A.unsqueeze(-1).unsqueeze(-1)

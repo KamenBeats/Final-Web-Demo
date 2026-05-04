@@ -18,12 +18,15 @@ CONTROLNET_WEIGHTS = os.environ.get("T3_CONTROLNET_WEIGHTS", str(_T3_DIR / "cont
 BASE_MODEL         = os.environ.get("T3_BASE_MODEL",         "SG161222/RealVisXL_V5.0_Lightning")
 VAE_MODEL          = os.environ.get("T3_VAE_MODEL",          "madebyollin/sdxl-vae-fp16-fix")
 LORA_PATH          = os.environ.get("T3_LORA_PATH",          str(_T3_DIR / "lora_best"))
+QWEN_ID            = os.environ.get("T3_QWEN_ID",            "Qwen/Qwen3-4B")
 T3_DEVICE          = os.environ.get("T3_DEVICE",             "")   # auto-detected below
 T3_DTYPE           = os.environ.get("T3_DTYPE",              "")
 
 # ── Globals ───────────────────────────────────────────────────────────────────
-_pipe    = None          # StableDiffusionXLFillPipeline on CPU RAM after load
-_loading = False         # guard against concurrent loads
+_pipe          = None   # StableDiffusionXLFillPipeline on CPU RAM after load
+_loading       = False  # guard against concurrent loads
+qwen_tokenizer = None   # AutoTokenizer
+qwen_model     = None   # AutoModelForCausalLM
 
 
 def _load_to_ram():
@@ -90,11 +93,31 @@ def _load_to_ram():
 
         if LORA_PATH and Path(LORA_PATH).exists():
             try:
-                from peft import PeftModel
+                from peft import PeftConfig, get_peft_model
+                from peft.utils import set_peft_model_state_dict
                 print(f"[Task3] Loading LoRA from {LORA_PATH}…")
-                pipe.unet = PeftModel.from_pretrained(pipe.unet, LORA_PATH)
+
+                # Use get_peft_model + set_peft_model_state_dict instead of
+                # PeftModel.from_pretrained — avoids accelerate meta-tensor creation.
+                peft_config = PeftConfig.from_pretrained(LORA_PATH)
+                pipe.unet = get_peft_model(pipe.unet, peft_config)
+
+                adapter_safetensors = Path(LORA_PATH) / "adapter_model.safetensors"
+                adapter_bin = Path(LORA_PATH) / "adapter_model.bin"
+                if adapter_safetensors.exists():
+                    from safetensors.torch import load_file as _st_load
+                    adapter_weights = _st_load(str(adapter_safetensors), device="cpu")
+                elif adapter_bin.exists():
+                    adapter_weights = torch.load(str(adapter_bin), map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"No adapter weights found in {LORA_PATH}")
+
+                incompatible = set_peft_model_state_dict(pipe.unet, adapter_weights)
+                if incompatible and getattr(incompatible, "unexpected_keys", None):
+                    print(f"[Task3] LoRA unexpected keys: {incompatible.unexpected_keys[:3]}")
+
                 pipe.unet.to(dtype=dtype)
-                print(f"[Task3] LoRA loaded, cast to {dtype} (matches CLI).")
+                print(f"[Task3] LoRA loaded via set_peft_model_state_dict, cast to {dtype}.")
             except ImportError:
                 print("[Task3] peft not installed — skipping LoRA.")
 

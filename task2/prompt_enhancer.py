@@ -1,9 +1,5 @@
 """
 task2/prompt_enhancer.py — Task-aware SDXL prompt enhancement for Web Demo.
-
-Adapted from SDXL_Lora/src/inference/prompt_enhancer.py.
-Uses M.pipe / M.qwen_* globals directly; handles GPU management internally.
-Returns (positive_prompt, negative_prompt) tuple.
 """
 
 import re
