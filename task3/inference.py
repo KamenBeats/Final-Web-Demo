@@ -80,12 +80,29 @@ def _prepare_canvas(
     target_size = (width, height)
 
     if use_padding_mode:
-        # Customize mode: keep source at original size, place at pad offset
-        source = image.copy()
-        new_width  = source.width
-        new_height = source.height
-        margin_x   = max(0, int(pad_left_px))
-        margin_y   = max(0, int(pad_top_px))
+        # Apply resize_option in padding mode (same as standard mode)
+        if resize_option == "50%":
+            rfactor = 0.5
+        elif resize_option == "33%":
+            rfactor = 1 / 3
+        elif resize_option == "25%":
+            rfactor = 0.25
+        elif resize_option not in ("Full", ""):
+            rfactor = custom_resize_percentage / 100.0
+        else:
+            rfactor = 1.0
+
+        if rfactor < 1.0:
+            new_width  = max(int(image.width  * rfactor), 64)
+            new_height = max(int(image.height * rfactor), 64)
+            source = image.resize((new_width, new_height), Image.LANCZOS)
+        else:
+            source = image.copy()
+            new_width  = source.width
+            new_height = source.height
+
+        margin_x = max(0, int(pad_left_px))
+        margin_y = max(0, int(pad_top_px))
     else:
         # Standard mode: scale source to fit inside canvas
         scale_factor = min(target_size[0] / image.width, target_size[1] / image.height)
@@ -231,6 +248,18 @@ def _sharpen_generated(
     return Image.composite(sharpened, generated, gen_area_mask)
 
 
+def _get_resize_factor(resize_option: str, custom_resize_pct: int) -> float:
+    if resize_option == "50%":
+        return 0.5
+    if resize_option == "33%":
+        return 1 / 3
+    if resize_option == "25%":
+        return 0.25
+    if resize_option not in ("Full", ""):
+        return max(1, int(custom_resize_pct)) / 100.0
+    return 1.0
+
+
 def _canvas_from_pads(image, pad_left_px, pad_right_px, pad_top_px, pad_bottom_px):
     """Compute exact canvas size from image + pixel padding, snapped to mult-of-8 for VAE."""
     pl = int(pad_left_px or 0)
@@ -254,13 +283,35 @@ def preview(image, target_res_label, custom_w, custom_h,
         return None
     is_custom = (target_res_label == "Customize")
     if is_custom:
+        # Account for resize_option when computing canvas size
+        factor = _get_resize_factor(resize_option, custom_resize_pct)
+        if factor < 1.0:
+            img_for_canvas = image.resize(
+                (max(int(image.width * factor), 64), max(int(image.height * factor), 64)),
+                Image.LANCZOS,
+            )
+        else:
+            img_for_canvas = image
         bw, bh, fw, fh, *_ = _canvas_from_pads(
-            image, pad_left_px, pad_right_px, pad_top_px, pad_bottom_px
+            img_for_canvas, pad_left_px, pad_right_px, pad_top_px, pad_bottom_px
         )
         if fw > _MAX_OUTPUT_PX or fh > _MAX_OUTPUT_PX:
-            return None  # invalid — don't show preview
+            raise ValueError(
+                f"Canvas {fw}×{fh}px vượt giới hạn {_MAX_OUTPUT_PX}px. "
+                f"Giảm padding để tiếp tục (hiện tại: trái={int(pad_left_px or 0)}, "
+                f"phải={int(pad_right_px or 0)}, trên={int(pad_top_px or 0)}, "
+                f"dưới={int(pad_bottom_px or 0)})."
+            )
+        if bw < 64 or bh < 64:
+            raise ValueError(f"Canvas quá nhỏ ({bw}×{bh}px). Thêm padding hoặc chọn ảnh lớn hơn.")
     else:
         bw, bh = _resolve_res(target_res_label, custom_w, custom_h)
+        if not can_expand(image.width, image.height, bw, bh, alignment):
+            raise ValueError(
+                f"Ảnh ({image.width}×{image.height}px) đã bằng hoặc lớn hơn "
+                f"kích thước đầu ra {target_res_label} ({bw}×{bh}px) theo hướng {alignment}. "
+                f"Thay đổi vị trí hoặc chọn tỉ lệ khác."
+            )
     try:
         bg, mask, _cnet, _rect = _prepare_canvas(
             image, bw, bh, overlap_percentage,
@@ -270,8 +321,8 @@ def preview(image, target_res_label, custom_w, custom_h,
             pad_left_px=int(pad_left_px or 0),
             pad_top_px=int(pad_top_px or 0),
         )
-    except Exception:
-        return image
+    except Exception as exc:
+        raise ValueError(f"Không thể tạo canvas: {exc}") from exc
     vis       = bg.copy().convert("RGBA")
     red_layer = Image.new("RGBA", bg.size, (0, 0, 0, 0))
     overlay   = Image.new("RGBA", bg.size, (255, 0, 0, 80))
@@ -294,9 +345,17 @@ def infer(
     is_custom = (target_res_label == "Customize")
 
     if is_custom:
-        # Canvas expansion mode: exact pixel arithmetic, image pasted at (left, top)
+        # Canvas expansion mode: account for resize_option when computing canvas
+        factor = _get_resize_factor(resize_option, custom_resize_pct)
+        if factor < 1.0:
+            img_for_canvas = image.resize(
+                (max(int(image.width * factor), 64), max(int(image.height * factor), 64)),
+                Image.LANCZOS,
+            )
+        else:
+            img_for_canvas = image
         bw, bh, fw_exact, fh_exact, pl, pr, pt, pb = _canvas_from_pads(
-            image, pad_left_px, pad_right_px, pad_top_px, pad_bottom_px
+            img_for_canvas, pad_left_px, pad_right_px, pad_top_px, pad_bottom_px
         )
         if fw_exact > _MAX_OUTPUT_PX or fh_exact > _MAX_OUTPUT_PX:
             raise gr.Error(

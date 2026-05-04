@@ -18,9 +18,9 @@ const DEFAULT_NEG_DELETE =
   'object, furniture, item, person, blurry, smudge, artifacts, distorted texture, mismatched pattern, text, watermark, low quality, messy, floating debris, ghosting'
 
 const DEFAULTS = {
-  Add: { strength: 1.0, cfg: 12.0, neg: DEFAULT_NEG_ADD, steps: 20 },
-  Replace: { strength: 1.0, cfg: 12.0, neg: DEFAULT_NEG_ADD, steps: 20 },
-  Delete: { strength: 0.99, cfg: 20.0, neg: DEFAULT_NEG_DELETE, steps: 20 },
+  Add: { strength: 1.0, cfg: 12.0, neg: DEFAULT_NEG_ADD, steps: 50 },
+  Replace: { strength: 1.0, cfg: 12.0, neg: DEFAULT_NEG_ADD, steps: 50 },
+  Delete: { strength: 0.99, cfg: 20.0, neg: DEFAULT_NEG_DELETE, steps: 50 },
 }
 
 const BOX_H = 500  // matching height for input & output boxes
@@ -30,7 +30,9 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
   const [imageUrl, setImageUrl] = useState(null)
   const [result, setResult] = useState(null)
   const [info, setInfo] = useState('')
+  const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(false)
+  const [demoLoading, setDemoLoading] = useState(false)
   const [enhancing, setEnhancing] = useState(false)
   const [lightboxOpen, setLightboxOpen] = useState(false)
 
@@ -44,9 +46,14 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
 
   const editorRef = useRef(null)
   const fileRef = useRef(null)
+  const skipDefaultsRef = useRef(false)
   const toast = useToast()
 
   useEffect(() => {
+    if (skipDefaultsRef.current) {
+      skipDefaultsRef.current = false
+      return
+    }
     const d = DEFAULTS[mode]
     setStrength(d.strength)
     setCfg(d.cfg)
@@ -169,13 +176,48 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
       } catch (_) {
         setInfo('')
       }
-      setResult(URL.createObjectURL(blob))
+      const url = URL.createObjectURL(blob)
+      const maskUrl = URL.createObjectURL(maskBlob)
+      setResult(url)
+      setHistory((prev) => [{ url, imageUrl, imageFile, mode, steps, strength, cfg, cnScale, prompt, negPrompt, maskUrl }, ...prev.slice(0, 19)])
     } catch (err) {
       toast({ title: 'Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
       setLoading(false)
     }
   }
+
+  const loadFromHistory = useCallback(async (h) => {
+    skipDefaultsRef.current = true
+    setMode(h.mode)
+    setSteps(h.steps)
+    setStrength(h.strength)
+    setCfg(h.cfg)
+    setCnScale(h.cnScale)
+    setPrompt(h.prompt)
+    setNegPrompt(h.negPrompt)
+    setResult(h.url)
+    setInfo('')
+    if (h.imageUrl) {
+      setImageUrl(h.imageUrl)
+      try {
+        const resp = await fetch(h.imageUrl)
+        const blob = await resp.blob()
+        setImageFile(new File([blob], 'restore.png', { type: blob.type }))
+      } catch { /* ignore */ }
+    }
+    // Restore mask: wait for MaskEditor to mount image, then load mask
+    if (h.maskUrl) {
+      await new Promise((resolve) => {
+        const check = () => {
+          if (editorRef.current?.loadMask) resolve()
+          else setTimeout(check, 100)
+        }
+        setTimeout(check, 800)
+      })
+      await editorRef.current.loadMask(h.maskUrl)
+    }
+  }, [])
 
   const DEMO_CONFIGS = {
     1: { image: '7.jpg', mask: '7.png', prompt: '7.txt' },
@@ -185,6 +227,7 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
   const handleDemo = async (n) => {
     const cfg = DEMO_CONFIGS[n]
     if (!cfg) return
+    setDemoLoading(true)
     try {
       // Fetch image
       const imgResp = await fetch(`/api/examples/task2/${cfg.image}`)
@@ -225,12 +268,11 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
       // Allow image to fully render in MaskEditor canvas
       await new Promise(r => setTimeout(r, 800))
       await editorRef.current.loadMask(maskUrl)
-      setLoading(false)
       toast({ title: 'Demo loaded ✓', description: 'Bấm "Xử lý" để chạy inference', status: 'success', duration: 3000 })
     } catch (err) {
       toast({ title: 'Demo Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
-      setLoading(false)
+      setDemoLoading(false)
     }
   }
 
@@ -250,7 +292,7 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
         {' — Vẽ mask trên vùng muốn sửa/điền, sau đó chọn chế độ Add, Delete hoặc Replace.'}
       </Text>
 
-      <DemoBox onDemo={handleDemo} loading={loading} />
+      <DemoBox onDemo={handleDemo} loading={demoLoading} />
 
       {/* Settings Panel */}
       <Box
@@ -436,12 +478,12 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
                   alt="Kết quả inpainting"
                   caption="Kết quả Inpainting & Editing"
                   downloadSrc={result}
-                  downloadName="result.png"
+                  downloadName="result.jpg"
                   maxH={`${BOX_H}px`} objectFit="contain" w="100%"
                 />
                 {/* Download button — top-left of result frame, visible on hover */}
                 <Box
-                  as="a" href={result} download="result.png"
+                  as="a" href={result} download="result.jpg"
                   position="absolute" top="8px" left="8px" zIndex={4}
                   opacity={0} transition="opacity 0.15s"
                   _groupHover={{ opacity: 1 }}
@@ -501,6 +543,55 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
           images={[{ src: imageUrl, caption: 'Ảnh gốc' }]}
           initialIndex={0}
         />
+      )}
+      {/* ── History ── */}
+      {history.length > 0 && (
+        <Accordion defaultIndex={[0]} allowToggle mt={4}>
+          <AccordionItem
+            bg="whiteAlpha.50" borderRadius="lg"
+            border="1px solid" borderColor="whiteAlpha.100"
+          >
+            <AccordionButton borderRadius="lg">
+              <Text fontSize="sm" fontWeight="600" flex="1" textAlign="left">
+                📋 Lịch sử xử lý ({history.length})
+              </Text>
+              <Button
+                size="xs" variant="ghost" colorScheme="red" mr={2}
+                onClick={(e) => { e.stopPropagation(); setHistory([]) }}
+              >
+                Xóa
+              </Button>
+              <AccordionIcon />
+            </AccordionButton>
+            <AccordionPanel>
+              <SimpleGrid columns={4} spacing={2}>
+                {history.map((h, i) => (
+                  <Box
+                    key={i} position="relative" borderRadius="md" overflow="hidden"
+                    border="1px solid" borderColor="whiteAlpha.100"
+                    cursor="pointer" role="group"
+                    onClick={() => loadFromHistory(h)}
+                    _hover={{ borderColor: 'brand.400' }}
+                    transition="all 0.2s"
+                    title={`Kết quả #${history.length - i} — Click để khôi phục`}
+                  >
+                    <Box
+                      as="img" src={h.url} w="100%"
+                      style={{ aspectRatio: '1', objectFit: 'cover', display: 'block' }}
+                    />
+                    <Box
+                      position="absolute" bottom={0} left={0} right={0}
+                      bg="blackAlpha.800" py="2px" textAlign="center"
+                      opacity={0} _groupHover={{ opacity: 1 }} transition="opacity 0.2s"
+                    >
+                      <Text fontSize="9px" color="brand.200" fontWeight="600">↩ Khôi phục</Text>
+                    </Box>
+                  </Box>
+                ))}
+              </SimpleGrid>
+            </AccordionPanel>
+          </AccordionItem>
+        </Accordion>
       )}
     </Box>
   )

@@ -3,13 +3,14 @@ import {
   Box, Button, SimpleGrid, Text, VStack, HStack, Center, Flex,
   Spinner, Badge, Switch, FormControl, FormLabel, useToast,
   Slider, SliderTrack, SliderFilledTrack, SliderThumb,
+  Accordion, AccordionItem, AccordionButton, AccordionPanel, AccordionIcon,
 } from '@chakra-ui/react'
 import { ZoomableImage } from './ImageLightbox.jsx'
 import DemoBox from './DemoBox.jsx'
 
 const DEMO_CONFIGS = {
-  1: { images: ['1/1.jpg', '1/2.jpg', '1/3.jpg', '1/4.jpg', '1/5.jpg'] },
-  2: { images: ['2/1.jpg', '2/2.jpg', '2/3.jpg'] },
+  1: { images: ['1/1.jpg', '1/2.jpg', '1/3.jpg'] },
+  2: { images: ['2/1.jpg', '2/2.jpg', '2/3.jpg', '2/4.jpg', '2/5.jpg'] },
 }
 
 export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
@@ -18,7 +19,9 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
   const [exposureLabels, setExposureLabels] = useState([])  // ['EV -2','EV -1','EV +1'] or []
   const [result, setResult] = useState(null)
   const [info, setInfo] = useState('')
+  const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(false)
+  const [demoLoading, setDemoLoading] = useState(false)
   const [brightness, setBrightness] = useState(100)  // 100 = chuẩn model, map 1-100 → 0.01-1.0
   const [generatingExposures, setGeneratingExposures] = useState(false)
   const fileRef = useRef(null)
@@ -161,7 +164,9 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
       } catch (_) {
         setInfo('')
       }
-      setResult(URL.createObjectURL(blob))
+      const url = URL.createObjectURL(blob)
+      setResult(url)
+      setHistory((prev) => [{ url, previews: [...previews], files: [...filesToUse], brightness }, ...prev.slice(0, 19)])
     } catch (err) {
       toast({ title: 'Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
@@ -169,18 +174,36 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
     }
   }, [files, brightness, toast])
 
-  const handleDemo = useCallback(async (n) => {
-    const cfg = DEMO_CONFIGS[n]
+  const loadFromHistory = useCallback((h) => {
+    setBrightness(h.brightness ?? 100)
+    setResult(h.url)
+    setInfo('')
+    if (h.previews && h.previews.length > 0) {
+      previews.forEach((p) => { if (p.startsWith('blob:')) URL.revokeObjectURL(p) })
+      setPreviews(h.previews)
+      setFiles(h.files || [])
+      setExposureLabels([])
+    }
+  }, [previews])
+
+  const handleDemo = useCallback(async (n) => {    const cfg = DEMO_CONFIGS[n]
     if (!cfg) return
-    setLoading(true)
+    setDemoLoading(true)
     setResult(null)
     setInfo('')
-    try {
-      // Set brightness based on demo: demo 1 = 100%, demo 2 = 80%
-      if (n === 1) setBrightness(100)
-      else if (n === 2) setBrightness(80)
 
-      // Fetch all demo images as File objects
+    if (n === 1) setBrightness(100)
+    else if (n === 2) setBrightness(70)
+
+    // 1. Hiện preview ngay bằng URL trực tiếp — không cần chờ fetch blob
+    previews.forEach((p) => { if (p.startsWith('blob:')) URL.revokeObjectURL(p) })
+    const directUrls = cfg.images.map((path) => `/api/examples/task1/${path}`)
+    setPreviews(directUrls)
+    setFiles([])
+    setExposureLabels([])
+
+    // 2. Fetch blob ở background (spinner vẫn hiện) — cần cho inference
+    try {
       const fetched = await Promise.all(
         cfg.images.map(async (path) => {
           const resp = await fetch(`/api/examples/task1/${path}`)
@@ -189,18 +212,14 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
           return new File([blob], path.split('/').pop(), { type: blob.type })
         })
       )
-      // Update previews
-      const newPreviews = fetched.map((f) => URL.createObjectURL(f))
       setFiles(fetched)
-      setPreviews(newPreviews)
-      setExposureLabels([])
-      // Run inference with the fetched files directly
-      await handleRun(fetched)
+      toast({ title: 'Demo loaded ✓', description: 'Bấm "Ghép & Xử lý" để chạy inference', status: 'success', duration: 3000 })
     } catch (err) {
       toast({ title: 'Demo Error', description: err.message, status: 'error', duration: 5000 })
-      setLoading(false)
+    } finally {
+      setDemoLoading(false)
     }
-  }, [handleRun, toast])
+  }, [previews, toast])
 
   // Gallery array for lightbox navigation
   const gallery = previews.map((src, i) => ({
@@ -217,7 +236,7 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
         {' — Tải 2+ ảnh với các mức độ sáng khác nhau để ghép thành 1 ảnh cân bằng ánh sáng. Hoặc 1 ảnh để tăng cường ánh sáng.'}
       </Text>
 
-      <DemoBox onDemo={handleDemo} loading={loading} />
+      <DemoBox onDemo={handleDemo} loading={demoLoading} />
 
       <SimpleGrid columns={2} spacing={6} alignItems="start">
         {/* Left — Upload & Preview */}
@@ -384,12 +403,12 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
                   alt="Kết quả"
                   caption="Kết quả Multi-Exposure Fusion"
                   downloadSrc={result}
-                  downloadName="result.png"
+                  downloadName="result.jpg"
                   maxH="350px" objectFit="contain" w="100%"
                 />
                 {/* Download button — top-left of result frame, visible on hover */}
                 <Box
-                  as="a" href={result} download="result.png"
+                  as="a" href={result} download="result.jpg"
                   position="absolute" top="8px" left="8px" zIndex={4}
                   opacity={0} transition="opacity 0.15s"
                   _groupHover={{ opacity: 1 }}
@@ -473,6 +492,55 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
           </Button>
         </VStack>
       </SimpleGrid>
+      {/* ── History ── */}
+      {history.length > 0 && (
+        <Accordion defaultIndex={[0]} allowToggle mt={4}>
+          <AccordionItem
+            bg="whiteAlpha.50" borderRadius="lg"
+            border="1px solid" borderColor="whiteAlpha.100"
+          >
+            <AccordionButton borderRadius="lg">
+              <Text fontSize="sm" fontWeight="600" flex="1" textAlign="left">
+                📋 Lịch sử xử lý ({history.length})
+              </Text>
+              <Button
+                size="xs" variant="ghost" colorScheme="red" mr={2}
+                onClick={(e) => { e.stopPropagation(); setHistory([]) }}
+              >
+                Xóa
+              </Button>
+              <AccordionIcon />
+            </AccordionButton>
+            <AccordionPanel>
+              <SimpleGrid columns={4} spacing={2}>
+                {history.map((h, i) => (
+                  <Box
+                    key={i} position="relative" borderRadius="md" overflow="hidden"
+                    border="1px solid" borderColor="whiteAlpha.100"
+                    cursor="pointer" role="group"
+                    onClick={() => loadFromHistory(h)}
+                    _hover={{ borderColor: 'brand.400' }}
+                    transition="all 0.2s"
+                    title={`Kết quả #${history.length - i} — Click để khôi phục`}
+                  >
+                    <Box
+                      as="img" src={h.url} w="100%"
+                      style={{ aspectRatio: '1', objectFit: 'cover', display: 'block' }}
+                    />
+                    <Box
+                      position="absolute" bottom={0} left={0} right={0}
+                      bg="blackAlpha.800" py="2px" textAlign="center"
+                      opacity={0} _groupHover={{ opacity: 1 }} transition="opacity 0.2s"
+                    >
+                      <Text fontSize="9px" color="brand.200" fontWeight="600">↩ Khôi phục</Text>
+                    </Box>
+                  </Box>
+                ))}
+              </SimpleGrid>
+            </AccordionPanel>
+          </AccordionItem>
+        </Accordion>
+      )}
     </Box>
   )
 }

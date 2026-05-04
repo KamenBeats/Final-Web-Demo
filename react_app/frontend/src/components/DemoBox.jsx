@@ -19,13 +19,15 @@ export default function DemoBox({ onDemo, loading }) {
                 </Text>
                 <Button
                     size="sm" fontSize="xs" variant="outline" colorScheme="brand"
-                    onClick={() => onDemo(1)} isDisabled={loading}
+                    onClick={() => onDemo(1)} isDisabled={loading} isLoading={loading}
+                    loadingText="Đang tải..."
                 >
                     Demo 1
                 </Button>
                 <Button
                     size="sm" fontSize="xs" variant="outline" colorScheme="brand"
-                    onClick={() => onDemo(2)} isDisabled={loading}
+                    onClick={() => onDemo(2)} isDisabled={loading} isLoading={loading}
+                    loadingText="Đang tải..."
                 >
                     Demo 2
                 </Button>

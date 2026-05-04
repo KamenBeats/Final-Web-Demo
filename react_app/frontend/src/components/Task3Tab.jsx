@@ -34,6 +34,7 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
   const [resultUrl, setResultUrl] = useState(null)
   const [info, setInfo] = useState('')
   const [loading, setLoading] = useState(false)
+  const [demoLoading, setDemoLoading] = useState(false)
   const [inputTab, setInputTab] = useState(0)
 
   const [targetRes, setTargetRes] = useState('1:1')
@@ -56,6 +57,8 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
 
   const [history, setHistory] = useState([])
   const [enhancing, setEnhancing] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState(null)
   const fileRef = useRef(null)
   const previewAbortRef = useRef(null)
   const toast = useToast()
@@ -181,10 +184,12 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
     padLeft, padRight, padTop, padBottom,
   ])
 
-  /* Fetch preview only when Preview tab is active, with reduced debounce */
+  /* Fetch preview whenever image or settings change */
   useEffect(() => {
-    if (!imageFile || inputTab !== 1) return
+    if (!imageFile) return
     const timer = setTimeout(async () => {
+      setPreviewLoading(true)
+      setPreviewError(null)
       try {
         // Cancel previous preview request if still pending
         if (previewAbortRef.current) {
@@ -198,14 +203,24 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
           body: fd,
           signal: previewAbortRef.current.signal
         })
-        if (resp.ok) setPreviewUrl(URL.createObjectURL(await resp.blob()))
+        if (resp.ok) {
+          setPreviewUrl(URL.createObjectURL(await resp.blob()))
+          setPreviewError(null)
+        } else {
+          const errText = await resp.text()
+          setPreviewError(errText)
+          setPreviewUrl(null)
+        }
       } catch (err) {
-        // Ignore preview errors and aborted requests
-        if (err.name !== 'AbortError') console.error(err)
+        if (err.name !== 'AbortError') {
+          setPreviewError(err.message)
+        }
+      } finally {
+        setPreviewLoading(false)
       }
-    }, 300)  // Reduced debounce from 500ms to 300ms for faster loading
+    }, 300)
     return () => clearTimeout(timer)
-  }, [buildFormData, imageFile, inputTab])
+  }, [buildFormData, imageFile])
 
   const handleRun = async () => {
     if (!imageFile) return
@@ -239,7 +254,13 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
       const url = URL.createObjectURL(await resultResp.blob())
       setResultUrl(url)
       setInfo(`Hoàn thành trong ${((Date.now() - t0) / 1000).toFixed(1)}s · ${numSteps} steps`)
-      setHistory((prev) => [{ url }, ...prev.slice(0, 19)])
+      setHistory((prev) => [{
+        url, imageUrl, imageFile,
+        targetRes, alignment, resizeOption, prompt,
+        numSteps, sharpen, loraScale,
+        overlapTop, overlapBottom, overlapLeft, overlapRight,
+        padTop, padBottom, padLeft, padRight,
+      }, ...prev.slice(0, 19)])
     } catch (err) {
       toast({ title: 'Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
@@ -252,9 +273,41 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
     2: { image: '2/2.jpg', prompt: '2/2.txt' },
   }
 
+  const loadFromHistory = useCallback(async (h) => {
+    setTargetRes(h.targetRes)
+    setAlignment(h.alignment)
+    setResizeOption(h.resizeOption)
+    setPrompt(h.prompt)
+    setNumSteps(h.numSteps)
+    setSharpen(h.sharpen)
+    setLoraScale(h.loraScale)
+    setOverlapTop(h.overlapTop)
+    setOverlapBottom(h.overlapBottom)
+    setOverlapLeft(h.overlapLeft)
+    setOverlapRight(h.overlapRight)
+    setPadTop(h.padTop)
+    setPadBottom(h.padBottom)
+    setPadLeft(h.padLeft)
+    setPadRight(h.padRight)
+    setResultUrl(h.url)
+    setPreviewUrl(null)
+    setPreviewError(null)
+    setInfo('')
+    setInputTab(0)
+    if (h.imageUrl) {
+      setImageUrl(h.imageUrl)
+      try {
+        const resp = await fetch(h.imageUrl)
+        const blob = await resp.blob()
+        setImageFile(new File([blob], 'restore.png', { type: blob.type }))
+      } catch { /* ignore */ }
+    }
+  }, [])
+
   const handleDemo = async (n) => {
     const demoCfg = DEMO_CONFIGS[n]
     if (!demoCfg) return
+    setDemoLoading(true)
     try {
       // Fetch image
       const imgResp = await fetch(`/api/examples/task3/${demoCfg.image}`)
@@ -281,12 +334,11 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
       setPadRight(500)
       setPrompt(demoPrompt)
       setInputTab(0)
-      setLoading(false)
       toast({ title: 'Demo loaded ✓', description: 'Bấm "Xử lý" để chạy inference', status: 'success', duration: 3000 })
     } catch (err) {
       toast({ title: 'Demo Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
-      setLoading(false)
+      setDemoLoading(false)
     }
   }
 
@@ -316,7 +368,7 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
         {' — Ảnh gốc được đặt lên canvas SDXL, vùng màu đỏ trong preview là nơi model tự vẽ thêm.'}
       </Text>
 
-      <DemoBox onDemo={handleDemo} loading={loading} />
+      <DemoBox onDemo={handleDemo} loading={demoLoading} />
 
       {/* ── Settings Panel ── */}
       <Box
@@ -556,7 +608,19 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
               )
             )}
             {inputTab === 1 && (
-              previewUrl ? (
+              previewLoading ? (
+                <Center h="100%">
+                  <VStack spacing={2}>
+                    <Spinner color="brand.400" size="md" thickness="2px" />
+                    <Text color="gray.500" fontSize="xs">Đang tạo preview...</Text>
+                  </VStack>
+                </Center>
+              ) : previewError ? (
+                <VStack p={4} spacing={2} justify="center" h="100%">
+                  <Text color="red.400" fontSize="sm" fontWeight="600">⚠️ Preview lỗi</Text>
+                  <Text color="gray.400" fontSize="xs" textAlign="center">{previewError}</Text>
+                </VStack>
+              ) : previewUrl ? (
                 <ZoomableImage
                   src={previewUrl}
                   alt="Preview"
@@ -619,7 +683,7 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
                 />
                 {/* Download button — top-left, visible on hover */}
                 <Box
-                  as="a" href={resultUrl} download="outpainting_result.png"
+                  as="a" href={resultUrl} download="outpainting_result.jpg"
                   position="absolute" top="8px" left="8px" zIndex={4}
                   opacity={0} transition="opacity 0.15s"
                   _groupHover={{ opacity: 1 }}
@@ -713,16 +777,27 @@ const Task3Tab = forwardRef(function Task3Tab(props, ref) {
             <AccordionPanel>
               <SimpleGrid columns={4} spacing={2}>
                 {history.map((h, i) => (
-                  <ZoomableImage
-                    key={i} src={h.url}
-                    alt={`Lịch sử ${i + 1}`}
-                    caption={`Kết quả #${history.length - i}`}
-                    borderRadius="md"
-                    objectFit="cover" aspectRatio={1}
-                    cursor="zoom-in" border="1px solid" borderColor="whiteAlpha.100"
+                  <Box
+                    key={i} position="relative" borderRadius="md" overflow="hidden"
+                    border="1px solid" borderColor="whiteAlpha.100"
+                    cursor="pointer" role="group"
+                    onClick={() => loadFromHistory(h)}
                     _hover={{ borderColor: 'brand.400' }}
                     transition="all 0.2s"
-                  />
+                    title={`Kết quả #${history.length - i} — Click để khôi phục`}
+                  >
+                    <Box
+                      as="img" src={h.url} w="100%"
+                      style={{ aspectRatio: '1', objectFit: 'cover', display: 'block' }}
+                    />
+                    <Box
+                      position="absolute" bottom={0} left={0} right={0}
+                      bg="blackAlpha.800" py="2px" textAlign="center"
+                      opacity={0} _groupHover={{ opacity: 1 }} transition="opacity 0.2s"
+                    >
+                      <Text fontSize="9px" color="brand.200" fontWeight="600">↩ Khôi phục</Text>
+                    </Box>
+                  </Box>
                 ))}
               </SimpleGrid>
             </AccordionPanel>

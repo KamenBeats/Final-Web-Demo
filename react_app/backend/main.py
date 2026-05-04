@@ -126,9 +126,12 @@ def _set_job_error(job_id: str, error: str):
             _jobs[job_id].update({"status": "error", "error": error})
 
 
-def _pil_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
+def _pil_to_bytes(img: Image.Image, fmt="JPEG") -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format=fmt, quality=95)
+    # Ensure RGB for JPEG (no alpha channel)
+    if fmt == "JPEG" and img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(buf, format=fmt, quality=92, optimize=True)
     buf.seek(0)
     return buf.getvalue()
 
@@ -355,18 +358,21 @@ async def task3_preview(
     from task3.inference import preview as task3_preview_fn
 
     img_pil = _read_upload_image(image)
-    result = task3_preview_fn(
-        img_pil, target_res, custom_w, custom_h,
-        alignment, resize_option, custom_resize_pct,
-        overlap_percentage, overlap_left, overlap_right,
-        overlap_top, overlap_bottom,
-        pad_left, pad_right, pad_top, pad_bottom,
-    )
+    try:
+        result = task3_preview_fn(
+            img_pil, target_res, custom_w, custom_h,
+            alignment, resize_option, custom_resize_pct,
+            overlap_percentage, overlap_left, overlap_right,
+            overlap_top, overlap_bottom,
+            pad_left, pad_right, pad_top, pad_bottom,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     if result is None:
         raise HTTPException(400, "Cannot generate preview")
 
     img_bytes = _pil_to_bytes(result)
-    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/jpeg")
 
 
 @app.post("/api/task3/run")
@@ -468,7 +474,7 @@ async def job_result(job_id: str):
         _jobs.pop(job_id, None)
     return StreamingResponse(
         io.BytesIO(result_bytes),
-        media_type="image/png",
+        media_type="image/jpeg",
         headers={"X-Info": quote(info, safe='')},
     )
 

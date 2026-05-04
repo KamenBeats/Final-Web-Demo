@@ -27,6 +27,8 @@ _pipe          = None   # StableDiffusionXLFillPipeline on CPU RAM after load
 _loading       = False  # guard against concurrent loads
 qwen_tokenizer = None   # AutoTokenizer
 qwen_model     = None   # AutoModelForCausalLM
+_lora_deltas: dict = {}       # precomputed (alpha/r) * B@A for each layer (CPU)
+_lora_current_scale: float = 0.0  # currently applied LoRA scale
 
 
 def _load_to_ram():
@@ -93,33 +95,55 @@ def _load_to_ram():
 
         if LORA_PATH and Path(LORA_PATH).exists():
             try:
-                from peft import PeftConfig, get_peft_model
-                from peft.utils import set_peft_model_state_dict
+                from safetensors.torch import load_file as _st_load
                 print(f"[Task3] Loading LoRA from {LORA_PATH}…")
-
-                # Use get_peft_model + set_peft_model_state_dict instead of
-                # PeftModel.from_pretrained — avoids accelerate meta-tensor creation.
-                peft_config = PeftConfig.from_pretrained(LORA_PATH)
-                pipe.unet = get_peft_model(pipe.unet, peft_config)
 
                 adapter_safetensors = Path(LORA_PATH) / "adapter_model.safetensors"
                 adapter_bin = Path(LORA_PATH) / "adapter_model.bin"
                 if adapter_safetensors.exists():
-                    from safetensors.torch import load_file as _st_load
                     adapter_weights = _st_load(str(adapter_safetensors), device="cpu")
                 elif adapter_bin.exists():
                     adapter_weights = torch.load(str(adapter_bin), map_location="cpu")
                 else:
                     raise FileNotFoundError(f"No adapter weights found in {LORA_PATH}")
 
-                incompatible = set_peft_model_state_dict(pipe.unet, adapter_weights)
-                if incompatible and getattr(incompatible, "unexpected_keys", None):
-                    print(f"[Task3] LoRA unexpected keys: {incompatible.unexpected_keys[:3]}")
+                # Read lora_alpha from adapter_config.json
+                import json as _json
+                cfg_path = Path(LORA_PATH) / "adapter_config.json"
+                lora_alpha = 32
+                if cfg_path.exists():
+                    with open(cfg_path) as _f:
+                        lora_alpha = _json.load(_f).get("lora_alpha", 32)
 
-                pipe.unet.to(dtype=dtype)
-                print(f"[Task3] LoRA loaded via set_peft_model_state_dict, cast to {dtype}.")
-            except ImportError:
-                print("[Task3] peft not installed — skipping LoRA.")
+                # Collect lora_A and lora_B weights
+                # Key format: base_model.model.{unet_path}.lora_A.default.weight
+                lora_a_w, lora_b_w = {}, {}
+                for k, v in adapter_weights.items():
+                    if ".lora_A.weight" in k:
+                        unet_key = k.replace("base_model.model.", "").replace(".lora_A.weight", ".weight")
+                        lora_a_w[unet_key] = v.to(dtype=dtype)
+                    elif ".lora_B.weight" in k:
+                        unet_key = k.replace("base_model.model.", "").replace(".lora_B.weight", ".weight")
+                        lora_b_w[unet_key] = v.to(dtype=dtype)
+
+                # Precompute deltas: (alpha/r) * B @ A — stored on CPU, applied in-place dynamically
+                global _lora_deltas
+                _lora_deltas = {}
+                unet_param_names = {n for n, _ in pipe.unet.named_parameters()}
+                for key in lora_a_w:
+                    if key not in lora_b_w or key not in unet_param_names:
+                        continue
+                    A = lora_a_w[key]   # [r, in_features]
+                    B = lora_b_w[key]   # [out_features, r]
+                    if A.ndim != 2 or B.ndim != 2:
+                        continue  # skip conv layers
+                    r = A.shape[0]
+                    _lora_deltas[key] = (B @ A) * (lora_alpha / r)
+                print(f"[Task3] LoRA ready: {len(_lora_deltas)} layers precomputed "
+                      f"(alpha={lora_alpha}). Default scale=0.0.")
+            except Exception as e:
+                print(f"[Task3] LoRA loading failed: {e}")
+                import traceback; traceback.print_exc()
 
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
@@ -156,11 +180,24 @@ def wait_until_loaded(timeout: float = 180.0):
 
 
 def set_lora_scale(scale: float):
-    """Set LoRA adapter scaling.  0.0 = base model only, 1.0 = full LoRA."""
-    if _pipe is None:
+    """Apply LoRA at the given scale by updating UNet weights in-place.
+    scale=0.0 → base model only; scale=1.0 → full LoRA effect.
+    """
+    global _lora_current_scale
+    if _pipe is None or not _lora_deltas:
+        _lora_current_scale = scale
+        return
+    delta_scale = scale - _lora_current_scale
+    if abs(delta_scale) < 1e-6:
         return
     try:
-        _pipe.unet.set_adapters(["default"], weights=[scale])
+        param_dict = {n: p for n, p in _pipe.unet.named_parameters()}
+        for key, delta in _lora_deltas.items():
+            if key in param_dict:
+                p = param_dict[key]
+                with torch.no_grad():
+                    p.data.add_(delta.to(device=p.device, dtype=p.dtype) * delta_scale)
+        _lora_current_scale = scale
         print(f"[Task3] LoRA scale set to {scale}")
     except Exception as e:
         print(f"[Task3] Could not set LoRA scale: {e}")
