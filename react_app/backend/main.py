@@ -285,6 +285,54 @@ async def task2_enhance_prompt(prompt: str = Form(...)):
 # Task 3 — Outpainting
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.post("/api/task3/enhance-prompt")
+async def task3_enhance_prompt(
+    prompt: str = Form(""),
+    image_caption: str = Form(""),
+    alignment: str = Form("Middle"),
+    resize_option: str = Form("Full"),
+    custom_resize_pct: int = Form(100),
+    target_res: str = Form("1:1"),
+    overlap_left: float = Form(10),
+    overlap_right: float = Form(10),
+    overlap_top: float = Form(10),
+    overlap_bottom: float = Form(10),
+):
+    """Enhance outpainting prompt using Qwen3. Queued through GPU queue."""
+    import json as _json
+    from task3.prompt_enhancer import enhance_prompt as _qwen_enhance
+
+    if not prompt.strip() and not image_caption.strip():
+        # Allow Qwen to generate a prompt from expansion context (alignment, resize etc.)
+        pass
+
+    job_id = _new_job()
+
+    def _run():
+        try:
+            _set_job_running(job_id)
+            enhanced = _qwen_enhance(
+                raw_prompt=prompt,
+                image_caption=image_caption,
+                alignment=alignment,
+                resize_option=resize_option,
+                custom_resize_pct=custom_resize_pct,
+                target_res_label=target_res,
+                overlap_left=overlap_left,
+                overlap_right=overlap_right,
+                overlap_top=overlap_top,
+                overlap_bottom=overlap_bottom,
+            )
+            _set_job_done(job_id, b"", _json.dumps({"enhanced": enhanced}))
+        except Exception as e:
+            import traceback
+            _set_job_error(job_id, str(e))
+            traceback.print_exc()
+
+    _GPU_QUEUE.put((_run, job_id))
+    return {"job_id": job_id}
+
+
 @app.post("/api/task3/preview")
 async def task3_preview(
     image: UploadFile = File(...),
@@ -508,8 +556,11 @@ if os.path.isdir(_FRONTEND_DIR):
         file_path = os.path.join(_FRONTEND_DIR, full_path)
         if full_path and os.path.isfile(file_path):
             return FileResponse(file_path)
-        # Fallback to index.html (SPA routing)
-        return FileResponse(os.path.join(_FRONTEND_DIR, "index.html"))
+        # Fallback to index.html (SPA routing) — always no-cache so browser picks up new bundles
+        return FileResponse(
+            os.path.join(_FRONTEND_DIR, "index.html"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 else:
     @app.get("/")
     async def no_frontend():

@@ -91,9 +91,42 @@ class ModelManager:
                     module.to_empty(device)
                     print(f"    ✓ to_empty() succeeded")
                 else:
-                    # If to_empty not available, re-raise with more info
-                    print(f"    ❌ Meta tensor found but to_empty() not available")
-                    raise
+                    # Module is likely a diffusers DiffusionPipeline (not nn.Module).
+                    # Iterate through pipeline.components and move each individually.
+                    # NOTE: do NOT use to_empty() — it allocates without initializing weights.
+                    components = getattr(module, 'components', None)
+                    if components:
+                        import torch.nn as nn
+                        from itertools import chain as _ichain
+                        meta_comps = []
+                        for cname, comp in components.items():
+                            if comp is None or not hasattr(comp, 'to'):
+                                continue
+                            try:
+                                has_meta = (
+                                    isinstance(comp, nn.Module)
+                                    and any(
+                                        p.is_meta
+                                        for p in _ichain(comp.parameters(), comp.buffers())
+                                    )
+                                )
+                                if has_meta:
+                                    meta_comps.append(cname)
+                                else:
+                                    comp.to(device)
+                            except Exception as ce:
+                                print(f"    ⚠️  {cname}: could not move: {ce}")
+                        if meta_comps:
+                            raise RuntimeError(
+                                f"Components with meta tensors (unloaded weights): {meta_comps}. "
+                                "This means the model was loaded with device_map or low_cpu_mem_usage "
+                                "that created meta tensors. Check task model loading — ensure "
+                                "low_cpu_mem_usage=False and avoid PeftModel.from_pretrained."
+                            )
+                        print(f"    ✓ Pipeline components moved to {device}")
+                    else:
+                        print(f"    ❌ Meta tensor found but to_empty() not available")
+                        raise
             else:
                 raise
         except TypeError:

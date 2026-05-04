@@ -4,6 +4,7 @@ import {
   Spinner, Textarea, useToast,
   Slider, SliderTrack, SliderFilledTrack, SliderThumb,
   Accordion, AccordionItem, AccordionButton, AccordionPanel, AccordionIcon,
+  NumberInput, NumberInputField, NumberInputStepper, NumberIncrementStepper, NumberDecrementStepper,
 } from '@chakra-ui/react'
 import { ZoomableImage, LightboxModal } from './ImageLightbox.jsx'
 import MaskEditor from './MaskEditor.jsx'
@@ -224,41 +225,8 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
       // Allow image to fully render in MaskEditor canvas
       await new Promise(r => setTimeout(r, 800))
       await editorRef.current.loadMask(maskUrl)
-
-      // Now run inference
-      const maskBlob = await editorRef.current.getMaskBlob()
-      if (!maskBlob) throw new Error('Failed to get mask')
-      setLoading(true)
-      await fetch('/api/activate/task2', { method: 'POST' }).catch(() => { })
-
-      const fd = new FormData()
-      fd.append('image', file)
-      fd.append('mask', maskBlob, 'mask.png')
-      fd.append('prompt', demoPrompt)
-      fd.append('negative_prompt', DEFAULT_NEG_ADD)
-      fd.append('task_type', 'Add')
-      fd.append('steps', 50)
-      fd.append('strength', 1.0)
-      fd.append('guidance_scale', 12.0)
-      fd.append('cn_scale', 0.3)
-
-      const submitResp = await fetch('/api/task2/run', { method: 'POST', body: fd })
-      if (!submitResp.ok) throw new Error(await submitResp.text())
-      const { job_id } = await submitResp.json()
-
-      while (true) {
-        await new Promise((r) => setTimeout(r, 10000))
-        const statusResp = await fetch(`/api/job/${job_id}/status`)
-        if (!statusResp.ok) throw new Error('Lost job status')
-        const { status, error } = await statusResp.json()
-        if (status === 'error') throw new Error(error || 'Inference failed')
-        if (status === 'done') break
-      }
-
-      const resultResp = await fetch(`/api/job/${job_id}/result`)
-      if (!resultResp.ok) throw new Error(await resultResp.text())
-      setInfo(decodeURIComponent(resultResp.headers.get('X-Info') || ''))
-      setResult(URL.createObjectURL(await resultResp.blob()))
+      setLoading(false)
+      toast({ title: 'Demo loaded ✓', description: 'Bấm "Xử lý" để chạy inference', status: 'success', duration: 3000 })
     } catch (err) {
       toast({ title: 'Demo Error', description: err.message, status: 'error', duration: 5000 })
     } finally {
@@ -311,10 +279,34 @@ const Task2Tab = forwardRef(function Task2Tab({ onSendToTask3 }, ref) {
                 <Text fontSize="xs" fontWeight="600" color="gray.400">{s.label}</Text>
                 <Text fontSize="xs" color="brand.300" fontWeight="600">{s.fmt ? s.fmt(s.val) : s.val}</Text>
               </Flex>
-              <Slider value={s.val} onChange={s.set} min={s.min} max={s.max} step={s.step} size="sm">
-                <SliderTrack><SliderFilledTrack bg="brand.500" /></SliderTrack>
-                <SliderThumb boxSize={3} />
-              </Slider>
+              <HStack spacing={2}>
+                <Box flex={1}>
+                  <Slider value={s.val} onChange={s.set} min={s.min} max={s.max} step={s.step} size="sm">
+                    <SliderTrack><SliderFilledTrack bg="brand.500" /></SliderTrack>
+                    <SliderThumb boxSize={3} />
+                  </Slider>
+                </Box>
+                <NumberInput
+                  size="xs" w="60px"
+                  value={s.fmt ? s.fmt(s.val) : s.val}
+                  onChange={(val) => {
+                    const num = parseFloat(val)
+                    if (!isNaN(num) && num >= s.min && num <= s.max) {
+                      s.set(num)
+                    }
+                  }}
+                  min={s.min}
+                  max={s.max}
+                  step={s.step}
+                  isValidCharacter={(char) => /[0-9.\-]/.test(char)}
+                >
+                  <NumberInputField />
+                  <NumberInputStepper>
+                    <NumberIncrementStepper />
+                    <NumberDecrementStepper />
+                  </NumberInputStepper>
+                </NumberInput>
+              </HStack>
             </Box>
           ))}
         </SimpleGrid>

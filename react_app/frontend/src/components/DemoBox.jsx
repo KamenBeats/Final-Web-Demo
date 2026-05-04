@@ -30,7 +30,7 @@ export default function DemoBox({ onDemo, loading }) {
                     Demo 2
                 </Button>
                 <Text fontSize="xs" color="gray.500" ml={1}>
-                    — Tự động load ảnh mẫu & chạy inference
+                    — Load ảnh, thông số & prompt (bấm nút để chạy)
                 </Text>
             </HStack>
         </Box>

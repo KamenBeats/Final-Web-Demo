@@ -15,12 +15,14 @@ const DEMO_CONFIGS = {
 export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
   const [files, setFiles] = useState([])
   const [previews, setPreviews] = useState([])
+  const [exposureLabels, setExposureLabels] = useState([])  // ['EV -2','EV -1','EV +1'] or []
   const [result, setResult] = useState(null)
   const [info, setInfo] = useState('')
   const [loading, setLoading] = useState(false)
-  // const [applyPhase2, setApplyPhase2] = useState(true)
-  const [brightness, setBrightness] = useState(100)  // 0 = tắt tăng cường, 100 = tối đa
+  const [brightness, setBrightness] = useState(100)  // 100 = chuẩn model, map 1-100 → 0.01-1.0
+  const [generatingExposures, setGeneratingExposures] = useState(false)
   const fileRef = useRef(null)
+  const exposureFileRef = useRef(null)
   const toast = useToast()
 
   // Append new files instead of replacing
@@ -30,6 +32,7 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
     const newPreviews = newFiles.map((f) => URL.createObjectURL(f))
     setFiles((prev) => [...prev, ...newFiles])
     setPreviews((prev) => [...prev, ...newPreviews])
+    setExposureLabels([])
     // Reset so same file can be re-added
     e.target.value = ''
   }, [])
@@ -41,6 +44,7 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
       const newPreviews = dropped.map((f) => URL.createObjectURL(f))
       setFiles((prev) => [...prev, ...dropped])
       setPreviews((prev) => [...prev, ...newPreviews])
+      setExposureLabels([])
     }
   }, [])
 
@@ -50,7 +54,74 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
       return prev.filter((_, i) => i !== deleteIdx)
     })
     setFiles((prev) => prev.filter((_, i) => i !== deleteIdx))
+    setExposureLabels([])
   }, [])
+
+  // Generate 3 exposure-bracketed images from a single source image (no inference)
+  const handleGenerateExposures = useCallback(async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    setGeneratingExposures(true)
+    try {
+      const img = new window.Image()
+      const url = URL.createObjectURL(file)
+      await new Promise((resolve, reject) => {
+        img.onload = resolve
+        img.onerror = reject
+        img.src = url
+      })
+      URL.revokeObjectURL(url)
+
+      // EV stops: -2, -1, +1 (3 ảnh, không gồm EV 0 = bản gốc)
+      const evStops = [-2, -1, 1]
+
+      const results = await Promise.all(evStops.map((ev) => new Promise((resolve) => {
+        const factor = Math.pow(2, ev)
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(img, 0, 0)
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+        const d = imageData.data
+        for (let i = 0; i < d.length; i += 4) {
+          // Gamma-correct exposure: decode sRGB → linear → scale → re-encode
+          for (let c = 0; c < 3; c++) {
+            const norm = d[i + c] / 255
+            const linear = Math.pow(norm, 2.2) * factor
+            d[i + c] = Math.round(Math.min(1, Math.pow(linear, 1 / 2.2)) * 255)
+          }
+        }
+        ctx.putImageData(imageData, 0, 0)
+        const previewUrl = canvas.toDataURL('image/png')
+        canvas.toBlob((blob) => {
+          resolve({
+            file: new File([blob], `ev${ev > 0 ? '+' : ''}${ev}.png`, { type: 'image/png' }),
+            preview: previewUrl,
+          })
+        }, 'image/png')
+      })))
+
+      // Replace current inputs with the 3 generated images
+      previews.forEach((p) => URL.revokeObjectURL(p))
+      setFiles(results.map((r) => r.file))
+      setPreviews(results.map((r) => r.preview))
+      setExposureLabels(evStops.map((ev) => `EV ${ev > 0 ? '+' : ''}${ev}`))
+      setResult(null)
+      setInfo('')
+      toast({
+        title: 'Đã tạo 3 ảnh đa phơi sáng',
+        description: 'EV −2, EV −1, EV +1 — bấm Ghép & Xử lý để fusion.',
+        status: 'success',
+        duration: 4000,
+      })
+    } catch (err) {
+      toast({ title: 'Lỗi tạo ảnh', description: err.message, status: 'error', duration: 5000 })
+    } finally {
+      setGeneratingExposures(false)
+    }
+  }, [previews, toast])
 
   const handleRun = useCallback(async (demoFiles = null) => {
     const filesToUse = demoFiles || files
@@ -63,16 +134,11 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
 
       const fd = new FormData()
       filesToUse.forEach((f) => fd.append('files', f))
-      // Nếu brightness = 0 thì bỏ qua tăng cường (apply_phase2=false)
-      if (brightness === 0) {
-        fd.append('apply_phase2', false)
-        fd.append('align', true)
-        fd.append('brightness', 1.0)
-      } else {
-        fd.append('apply_phase2', true)
-        fd.append('align', true)
-        fd.append('brightness', (brightness / 100).toFixed(2))
-      }
+      // Phase 2 (ToneNet) luôn bật
+      fd.append('apply_phase2', true)
+      fd.append('align', true)
+      // Map 1–100% → 0.01–1.0 (100% = chuẩn model)
+      fd.append('brightness', (brightness / 100).toFixed(2))
       const submitResp = await fetch('/api/task1/run', { method: 'POST', body: fd })
       if (!submitResp.ok) throw new Error(await submitResp.text())
       const { job_id } = await submitResp.json()
@@ -110,6 +176,10 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
     setResult(null)
     setInfo('')
     try {
+      // Set brightness based on demo: demo 1 = 100%, demo 2 = 80%
+      if (n === 1) setBrightness(100)
+      else if (n === 2) setBrightness(80)
+
       // Fetch all demo images as File objects
       const fetched = await Promise.all(
         cfg.images.map(async (path) => {
@@ -123,6 +193,7 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
       const newPreviews = fetched.map((f) => URL.createObjectURL(f))
       setFiles(fetched)
       setPreviews(newPreviews)
+      setExposureLabels([])
       // Run inference with the fetched files directly
       await handleRun(fetched)
     } catch (err) {
@@ -187,6 +258,21 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
                       aspectRatio={1}
                       display="block"
                     />
+                    {/* EV label badge */}
+                    {exposureLabels[i] && (
+                      <Box
+                        position="absolute" bottom="4px" left="50%" zIndex={2}
+                        transform="translateX(-50%)"
+                        bg="blackAlpha.700" borderRadius="sm" px={1}
+                        pointerEvents="none"
+                      >
+                        <Text fontSize="9px" fontWeight="700" color={
+                          exposureLabels[i].includes('+') ? 'orange.300' : 'blue.300'
+                        }>
+                          {exposureLabels[i]}
+                        </Text>
+                      </Box>
+                    )}
                     {/* Delete button */}
                     <Box
                       as="button"
@@ -236,6 +322,38 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
             </Text>
             <Text color="gray.500" fontSize="xs" mt={1}>
               2+ ảnh cùng kích thước được khuyến nghị
+            </Text>
+          </Box>
+
+          {/* Tạo 3 ảnh đa phơi sáng từ 1 ảnh */}
+          <Box>
+            <input
+              ref={exposureFileRef} type="file" accept="image/*"
+              onChange={handleGenerateExposures} style={{ display: 'none' }}
+            />
+            <Button
+              w="full" size="sm" variant="outline" colorScheme="orange"
+              isLoading={generatingExposures}
+              loadingText="Đang tạo ảnh..."
+              onClick={() => exposureFileRef.current?.click()}
+              leftIcon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="5" />
+                  <line x1="12" y1="1" x2="12" y2="3" />
+                  <line x1="12" y1="21" x2="12" y2="23" />
+                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                  <line x1="1" y1="12" x2="3" y2="12" />
+                  <line x1="21" y1="12" x2="23" y2="12" />
+                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                </svg>
+              }
+            >
+              Tạo 3 ảnh đa phơi sáng từ 1 ảnh
+            </Button>
+            <Text color="gray.600" fontSize="xs" mt={1} textAlign="center">
+              Tự động tạo EV −2, −1, +1 (không inference ngay)
             </Text>
           </Box>
         </VStack>
@@ -326,16 +444,22 @@ export default function Task1Tab({ onSendToTask2, onSendToTask3 }) {
             </HStack>
           )}
 
-          {/* Tăng cường ánh sáng & màu sắc (0% = tắt, 100% = tối đa) */}
+          {/* Tăng cường ánh sáng & màu sắc */}
           <Box px={1} pt={2}>
             <Flex justify="space-between" mb={1}>
-              <Text fontSize="xs" color="gray.400">☀️ Tăng cường ánh sáng & màu sắc</Text>
-              <Text fontSize="xs" color="brand.300" fontWeight="600">{brightness}%</Text>
+              <Text fontSize="xs" color="gray.400">☀️ Độ tăng cường ánh sáng & màu sắc</Text>
+              <Text fontSize="xs" color="brand.300" fontWeight="600">
+                {brightness === 100 ? '100% (chuẩn)' : `${brightness}%`}
+              </Text>
             </Flex>
-            <Slider value={brightness} onChange={setBrightness} min={0} max={100} step={1} size="sm">
+            <Slider value={brightness} onChange={setBrightness} min={1} max={100} step={1} size="sm">
               <SliderTrack><SliderFilledTrack bg="brand.500" /></SliderTrack>
               <SliderThumb boxSize={3} />
             </Slider>
+            <Flex justify="space-between" mt={1}>
+              <Text fontSize="9px" color="gray.600">Tối (1%)</Text>
+              <Text fontSize="9px" color="gray.500">100% = chuẩn model</Text>
+            </Flex>
           </Box>
 
           <Button
